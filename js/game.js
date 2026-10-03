@@ -1,11 +1,14 @@
 // ===== ゲームロジック（純粋関数：状態を受け取り、変更して返す） =====
 import {
-  STATS, STAT_FULL, TYPES, MISSIONS, ELIM, DEBUT, SONGS, NORMAL_SONGS, POS_SONGS, DIFF, FAIL_MULT,
-  CARDS, CARD_IDS, HAPPS, NPCS, NPC_IDS, SKILL_LIST,
+  STATS, STAT_NAMES, TYPES, MISSIONS, TEAM_SIZE, SONG_CHOICES, SONGS, NEED, FAIL_MULT, MATE_RATE, VOTES,
+  CARDS, TRAIN_IDS, ACTION_IDS, TARGETED, TRAITS, NPCS, NPC_IDS, HAPPS,
 } from './cards.js';
 
-export const MAX_PLAYERS = 4, MAX_CUSTOM = 20, USES = 3, DRAW = 4, HAND_MAX = 8, WEEKS = MISSIONS.length;
-const VOTE_RATE = 80;
+export const MAX_PLAYERS = 4, MAX_CUSTOM = 20;
+export const TRAIN_USES = 2, ACTION_SETS = 2;
+const TRAIN_START = 3, TRAIN_DRAW = 2, TRAIN_MAX = 6;
+const ACT_START = 2, ACT_DRAW = 2, ACT_MAX = 5;
+export const WEEKS = MISSIONS.length;
 
 const err = m => { throw new Error(m); };
 const rand = n => Math.floor(Math.random() * n);
@@ -17,27 +20,27 @@ const shuffle = a => {
   }
   return a;
 };
-const round10 = v => Math.round(v / 10) * 10;
 
 export const getP = (s, pid) => s.players.find(p => p.id === pid);
 export const isHost = (s, pid) => s.hostId === pid;
 export const npcDef = (s, cid) => NPCS[cid] || (s.custom || []).find(c => c.id === cid);
 export const mission = s => MISSIONS[s.mission - 1];
-export const song = id => SONGS[id];
+export const curSong = s => SONGS[s.song];
 export const mainStat = so => STATS.reduce((a, k) => (so.w[k] > so.w[a] ? k : a), 'vo');
+export const needOf = so => NEED[so.diff];
 
 function addLog(s, m) {
   s.log = s.log || [];
   s.log.push({ w: s.mission || 0, m });
-  if (s.log.length > 150) s.log = s.log.slice(-150);
+  if (s.log.length > 200) s.log = s.log.slice(-200);
 }
 
-// ---------- ロビー ----------
+// ---------- 待機室 ----------
 export function joinRoom(s, pid, name, roomId) {
   name = (name || '').trim().slice(0, 10);
   if (!name) err('名前を入力してください');
   // 部屋がない、または旧バージョンの部屋なら新しく作る
-  if (!s || !s.v2) return { v2: true, roomId, status: 'lobby', hostId: pid, players: [{ id: pid, name, type: 'allround' }], custom: [], log: [], created: Date.now() };
+  if (!s || s.v !== 4) return { v: 4, roomId, status: 'lobby', hostId: pid, players: [{ id: pid, name, type: 'allround' }], custom: [], log: [], created: Date.now() };
   const p = getP(s, pid);
   if (p) {
     if (s.status === 'lobby') p.name = name;
@@ -63,14 +66,14 @@ export function leaveRoom(s, pid) {
 }
 
 export function setType(s, pid, type) {
-  if (s.status !== 'lobby') err('ロビーでのみ変更できます');
+  if (s.status !== 'lobby') err('待機室でのみ変更できます');
   if (!TYPES[type]) err('不明なタイプです');
   getP(s, pid).type = type;
   return s;
 }
 
 export function addCustom(s, pid, c) {
-  if (s.status !== 'lobby') err('ロビーでのみ追加できます');
+  if (s.status !== 'lobby') err('待機室でのみ追加できます');
   s.custom = s.custom || [];
   if (s.custom.length >= MAX_CUSTOM) err(`オリジナル練習生は${MAX_CUSTOM}人までです`);
   const name = String(c.name || '').trim().slice(0, 10);
@@ -78,17 +81,15 @@ export function addCustom(s, pid, c) {
   const num = v => Math.max(0, Math.min(9, Math.floor(Number(v) || 0)));
   const id = 'C' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
   s.custom.push({
-    id, custom: true, owner: pid, star: false, name,
-    vo: num(c.vo), da: num(c.da), ra: num(c.ra), vi: num(c.vi),
-    skill: SKILL_LIST.includes(c.skill) ? c.skill : 'なし',
-    country: String(c.country || '').trim().slice(0, 8),
+    id, custom: true, owner: pid, name, vo: num(c.vo), da: num(c.da), ra: num(c.ra), vi: num(c.vi),
+    trait: TRAITS[c.trait] ? c.trait : 'leader', country: String(c.country || '').trim().slice(0, 8),
   });
   addLog(s, `オリジナル練習生「${name}」が番組に参加！`);
   return s;
 }
 
 export function removeCustom(s, pid, id) {
-  if (s.status !== 'lobby') err('ロビーでのみ削除できます');
+  if (s.status !== 'lobby') err('待機室でのみ削除できます');
   const c = (s.custom || []).find(x => x.id === id);
   if (!c) return s;
   if (c.owner !== pid && s.hostId !== pid) err('作成者かホストだけが削除できます');
@@ -100,392 +101,396 @@ export function removeCustom(s, pid, id) {
 export function startGame(s, pid) {
   if (!isHost(s, pid)) err('ホストだけが開始できます');
   if (s.status !== 'lobby') err('すでに開始しています');
-  if (s.players.length < 1) err('参加者がいません');
+  if (s.players.length < 2) err('2人以上で開始できます');
+  s.tdeck = shuffle([...TRAIN_IDS]); s.tdiscard = [];
+  s.adeck = shuffle([...ACTION_IDS]); s.adiscard = [];
   s.players.forEach(p => {
-    const t = TYPES[p.type] || TYPES.allround;
-    Object.assign(p, { st: { ...t.st }, fans: 0, hand: [], r: null, rank: 0, prevRank: 0, grade: '' });
+    Object.assign(p, { st: { ...(TYPES[p.type] || TYPES.allround).st }, votes: 0, rank: 1, train: [], act: [], r: null, chose: 0 });
+    drawTo(s, p, 'train', TRAIN_START);
+    drawTo(s, p, 'act', ACT_START);
   });
-  // NPC：初期人気（番組放送前の知名度）と人気係数
-  s.npc = {};
-  [...NPC_IDS, ...(s.custom || []).map(c => c.id)].forEach(id => {
-    const d = npcDef(s, id);
-    const pop = d.star ? 1.5 + Math.random() * 0.5 : 0.7 + Math.random() * 0.7;
-    s.npc[id] = { fans: round10((d.star ? 2500 : 0) + Math.random() * 2500), pop: Math.round(pop * 100) / 100, out: 0, rank: 0, prevRank: 0 };
-  });
-  s.deck = shuffle([...CARD_IDS]);
-  s.discard = [];
-  Object.assign(s, { status: 'playing', mission: 0, results: null, ranking: null, history: [], log: [] });
-  calcRanking(s);
-  addLog(s, `オーディション番組スタート！ 参加練習生 ${Object.keys(s.npc).length + s.players.length}人`);
+  Object.assign(s, { status: 'playing', mission: 0, played: [], priority: [], results: null, history: [], log: [] });
+  addLog(s, 'オーディション番組スタート！');
   startMission(s);
   return s;
 }
 
-function draw(s, p, n) {
-  let c = 0;
-  for (let i = 0; i < n && p.hand.length < HAND_MAX; i++) {
-    if (!s.deck.length) {
-      if (!s.discard.length) break;
-      s.deck = shuffle(s.discard);
-      s.discard = [];
+function drawTo(s, p, kind, n) {
+  const [deck, disc, max] = kind === 'train' ? ['tdeck', 'tdiscard', TRAIN_MAX] : ['adeck', 'adiscard', ACT_MAX];
+  for (let i = 0; i < n && p[kind].length < max; i++) {
+    if (!s[deck].length) {
+      if (!s[disc].length) break;
+      s[deck] = shuffle(s[disc]);
+      s[disc] = [];
     }
-    p.hand.push(s.deck.pop());
-    c++;
+    p[kind].push(s[deck].pop());
   }
-  return c;
-}
-
-const activeNpcs = s => Object.keys(s.npc).filter(id => !s.npc[id].out);
-
-function pickMates(s, n, exclude = []) {
-  const used = new Set(exclude);
-  s.players.forEach(p => (p.r?.mates || []).forEach(m => used.add(m.cid)));
-  let pool = shuffle(activeNpcs(s).filter(id => !used.has(id)));
-  if (pool.length < n) pool = pool.concat(shuffle(activeNpcs(s).filter(id => !exclude.includes(id) && !pool.includes(id))));
-  return pool.slice(0, n).map(cid => ({ cid, mod: { vo: 0, da: 0, ra: 0, vi: 0 } }));
-}
-
-function pick2Songs(exclude = []) {
-  return shuffle(NORMAL_SONGS.filter(k => !exclude.includes(k))).slice(0, 2);
 }
 
 function startMission(s) {
   s.mission++;
-  s.phase = 'practice';
   const M = mission(s);
-  addLog(s, `── 第${s.mission}課題「${M.name}」──`);
-  s.players.forEach(p => { p.r = null; });
+  s.ready = {};
   s.players.forEach(p => {
-    p.r = {
-      songs: M.pos ? [...POS_SONGS] : pick2Songs(), song: null, mates: [], hap: null,
-      used: 0, ready: false, tmp: { stage: 0, team: 0, mate: 0 }, tmpSt: { vo: 0, da: 0, ra: 0, vi: 0 }, early: 0, notes: [],
-    };
-    p.r.mates = pickMates(s, M.team);
-    if (p.type === 'allround') {
-      const k = pick(STATS);
-      p.st[k]++;
-      p.r.notes.push(`オールラウンダー：${STAT_FULL[k]}+1`);
-    }
-    draw(s, p, s.mission === 1 ? DRAW + 1 : DRAW);
-    applyHap(s, p, M);
+    p.r = { mates: [], used: 0, set: [], ready: false };
+    drawTo(s, p, 'train', TRAIN_DRAW);
+    drawTo(s, p, 'act', ACT_DRAW);
   });
+  // 選曲担当：まだ選んだ回数が少ない人の中からランダム
+  const minC = Math.min(...s.players.map(p => p.chose));
+  const by = pick(s.players.filter(p => p.chose === minC));
+  const unplayed = Object.keys(SONGS).filter(k => !s.played.includes(k));
+  let choices = shuffle(unplayed.filter(k => M.diffs.includes(SONGS[k].diff))).slice(0, SONG_CHOICES);
+  if (choices.length < SONG_CHOICES) choices = choices.concat(shuffle(unplayed.filter(k => !choices.includes(k))).slice(0, SONG_CHOICES - choices.length));
+  s.songPick = { by: by.id, choices };
+  s.song = null;
+  s.phase = 'song';
+  addLog(s, `── 第${s.mission}課題「${M.name}」── 選曲担当は ${by.name}`);
 }
 
-function addFans(p, v) { p.fans += v; p.r.early += v; }
-
-function applyHap(s, p, M) {
-  const keys = Object.keys(HAPPS).filter(k => M.team || !HAPPS[k].team);
-  const k = pick(keys);
-  const r = p.r;
-  r.hap = k;
-  const mate = () => pick(r.mates);
-  const nm = m => npcDef(s, m.cid).name;
-  let detail = '';
-  switch (k) {
-    case 'baddancer': {
-      const m = r.mates.reduce((a, b) => (npcDef(s, b.cid).da < npcDef(s, a.cid).da ? b : a));
-      m.mod.da -= 3; detail = `${nm(m)}のダンスが…（ダンス-3）`; break;
-    }
-    case 'badsinger': {
-      const m = r.mates.reduce((a, b) => (npcDef(s, b.cid).vo < npcDef(s, a.cid).vo ? b : a));
-      m.mod.vo -= 3; detail = `${nm(m)}の音程が…（ボーカル-3）`; break;
-    }
-    case 'ace': {
-      const stars = activeNpcs(s).filter(id => npcDef(s, id).star && !r.mates.some(m => m.cid === id));
-      const m = mate();
-      if (stars.length) { m.cid = pick(stars); m.mod = { vo: 0, da: 0, ra: 0, vi: 0 }; }
-      else { m.mod = { vo: 2, da: 2, ra: 2, vi: 2 }; }
-      detail = `${nm(m)}と同じチームに！`; break;
-    }
-    case 'fight': r.tmp.team -= 4; r.tmp.stage += 2; break;
-    case 'mood': r.tmp.team += 6; break;
-    case 'leader': r.tmp.team += 3; addFans(p, 200); break;
-    case 'killing': r.tmp.stage += 5; break;
-    case 'injury': r.tmpSt.da -= 2; break;
-    case 'cold': r.tmpSt.vo -= 2; break;
-    case 'devil': addFans(p, -400); break;
-    case 'angel': addFans(p, 400); break;
-    case 'mentor': {
-      const top = STATS.reduce((a, b) => (p.st[b] > p.st[a] ? b : a));
-      p.st[top]++; detail = `${STAT_FULL[top]}+1`; break;
-    }
-    case 'fancam': addFans(p, p.type === 'visual' ? 1000 : 600); break;
-    default: break;
-  }
-  r.hapDetail = detail;
-}
-
-// ---------- 練習フェーズ（全員同時） ----------
-function myRound(s, pid) {
-  if (s.status !== 'playing' || s.phase !== 'practice') err('今は練習期間ではありません');
-  const p = getP(s, pid);
-  if (!p) err('参加者ではありません');
-  if (p.r.ready) err('すでに準備完了しています');
-  return p;
-}
-
+// ---------- 選曲 ----------
 export function chooseSong(s, pid, songId) {
-  const p = myRound(s, pid);
-  if (!p.r.songs.includes(songId)) err('選べない曲です');
-  p.r.song = songId;
+  if (s.status !== 'playing' || s.phase !== 'song') err('今は選曲の時間ではありません');
+  if (s.songPick.by !== pid) err('選曲担当ではありません');
+  if (!s.songPick.choices.includes(songId)) err('その曲は選べません');
+  const p = getP(s, pid);
+  p.chose++;
+  s.song = songId;
+  s.played.push(songId);
+  addLog(s, `${p.name} が課題曲「${SONGS[songId].name}」を選びました`);
+  startDraft(s);
   return s;
 }
 
-export function playCard(s, pid, cid, prm = {}) {
-  const p = myRound(s, pid);
-  const r = p.r;
-  if (r.used >= USES) err(`練習カードは1課題に${USES}枚までです`);
-  if (!p.hand.includes(cid)) err('手札にありません');
-  const c = CARDS[cid];
-  let msg = '';
-  switch (c.kind) {
-    case 'vo': case 'da': case 'ra': case 'vi':
-      p.st[c.kind] += 2; msg = `${STAT_FULL[c.kind]}+2`; break;
-    case 'all':
-      STATS.forEach(k => p.st[k]++); msg = '全能力+1'; break;
-    case 'low': {
-      const k = STATS.reduce((a, b) => (p.st[b] < p.st[a] ? b : a));
-      p.st[k] += 3; msg = `${STAT_FULL[k]}+3`; break;
-    }
-    case 'night':
-      if (!STATS.includes(prm.stat)) err('上げる能力を選んでください');
-      p.st[prm.stat] += 3; r.tmp.stage -= 5; msg = `${STAT_FULL[prm.stat]}+3（寝不足でステージ点-5）`; break;
-    case 'study': {
-      if (!r.song) err('先に課題曲を選んでください');
-      const k = mainStat(song(r.song));
-      p.st[k] += 2; r.tmp.stage += 2; msg = `${STAT_FULL[k]}+2、ステージ点+2`; break;
-    }
-    case 'killing': r.tmp.stage += 6; msg = 'ステージ点+6'; break;
-    case 'teamprac':
-      if (!r.mates.length) err('この課題はソロステージです');
-      r.tmp.mate += 3; msg = 'チームメイト全員+3'; break;
-    case 'swap': {
-      if (!r.mates.length) err('この課題はソロステージです');
-      const so = song(r.song || r.songs[0]);
-      const weakest = r.mates.reduce((a, b) => (npcScore(s, b, so).score < npcScore(s, a, so).score ? b : a));
-      const [nw] = pickMates(s, 1, r.mates.map(m => m.cid));
-      if (!nw) err('入れ替えられる練習生がいません');
-      msg = `${npcDef(s, weakest.cid).name} → ${npcDef(s, nw.cid).name} に交代`;
-      Object.assign(weakest, nw);
-      break;
-    }
-    case 'reroll':
-      if (mission(s).pos) err('ポジション評価では使えません');
-      r.songs = pick2Songs(r.songs); r.song = null; msg = '課題曲の候補を引き直した'; break;
-    case 'pr': addFans(p, 600); msg = '得票+600'; break;
-    case 'devil': {
-      const o = getP(s, prm.opp);
-      if (!o || o.id === pid) err('相手を選んでください');
-      o.fans -= 500;
-      if (o.r) o.r.early -= 500;
-      msg = `${o.name} の得票-500`;
-      break;
-    }
-    default: err('不明なカードです');
+// ---------- メンバー選び（指名 or 押し付け） ----------
+function startDraft(s) {
+  const base = [...s.players].sort((a, b) => a.votes - b.votes || Math.random() - 0.5).map(p => p.id);
+  const pri = (s.priority || []).filter(id => base.includes(id));
+  const order = [...new Set([...pri, ...base])];
+  const all = [...NPC_IDS, ...(s.custom || []).map(c => c.id)];
+  s.draft = { pool: shuffle(all).slice(0, s.players.length * TEAM_SIZE + 2), order, idx: 0, taken: {} };
+  s.priority = [];
+  s.phase = 'draft';
+  addLog(s, `メンバー選び：指名順 ${order.map(id => getP(s, id).name).join(' → ')}${pri.length ? '（優先指名権あり）' : ''}`);
+}
+
+export const drafter = s => (s.phase === 'draft' ? s.draft.order[s.draft.idx % s.draft.order.length] : null);
+export const hasSlot = p => p.r.mates.length < TEAM_SIZE;
+
+export function draftPick(s, pid, cid, toPid) {
+  if (s.status !== 'playing' || s.phase !== 'draft') err('今はメンバー選びではありません');
+  if (drafter(s) !== pid) err('あなたの指名の番ではありません');
+  if (!s.draft.pool.includes(cid) || s.draft.taken[cid]) err('その練習生は選べません');
+  const to = getP(s, toPid || pid);
+  if (!to) err('相手が見つかりません');
+  if (!hasSlot(to)) err(`${to.id === pid ? 'あなた' : to.name}のチームはもう満員です`);
+  doPick(s, getP(s, pid), cid, to);
+  return s;
+}
+
+function doPick(s, p, cid, to) {
+  s.draft.taken[cid] = to.id;
+  to.r.mates.push(cid);
+  s.draft.idx++;
+  const nm = npcDef(s, cid).name;
+  addLog(s, to.id === p.id ? `${p.name} が ${nm} を指名` : `${p.name} が ${nm} を ${to.name} に押し付けた！`);
+  if (s.players.every(q => !hasSlot(q))) {
+    s.phase = 'practice';
+    addLog(s, 'メンバー決定！ 練習期間スタート');
   }
-  p.hand.splice(p.hand.indexOf(cid), 1);
-  s.discard.push(cid);
-  r.used++;
+}
+
+// ---------- 練習期間 ----------
+function practicing(s, pid) {
+  if (s.status !== 'playing' || s.phase !== 'practice') err('今は練習期間ではありません');
+  const p = getP(s, pid);
+  if (!p) err('参加者ではありません');
+  if (p.r.ready) err('準備完了を取り消すと操作できます');
+  return p;
+}
+
+export function useTrain(s, pid, cid, prm = {}) {
+  const p = practicing(s, pid);
+  if (p.r.used >= TRAIN_USES) err(`練習カードは1課題に${TRAIN_USES}枚までです`);
+  if (!p.train.includes(cid)) err('手札にありません');
+  const c = CARDS[cid];
+  let msg;
+  if (STATS.includes(c.kind)) { p.st[c.kind] += 2; msg = `${STAT_NAMES[c.kind]}+2`; }
+  else if (c.kind === 'any') {
+    if (!STATS.includes(prm.stat)) err('上げる能力を選んでください');
+    p.st[prm.stat] += 3; msg = `${STAT_NAMES[prm.stat]}+3`;
+  } else if (c.kind === 'all') { STATS.forEach(k => p.st[k]++); msg = '全能力+1'; }
+  else err('不明なカードです');
+  p.train.splice(p.train.indexOf(cid), 1);
+  s.tdiscard.push(cid);
+  p.r.used++;
   addLog(s, `${p.name}：「${c.name}」${msg}`);
   return s;
 }
 
+export function setAction(s, pid, cid, prm = {}) {
+  const p = practicing(s, pid);
+  if (p.r.set.length >= ACTION_SETS) err(`アクションカードは1課題に${ACTION_SETS}枚までです`);
+  if (!p.act.includes(cid)) err('手札にありません');
+  const c = CARDS[cid];
+  let opp = null;
+  if (TARGETED.includes(c.kind)) {
+    const o = getP(s, prm.opp);
+    if (!o || o.id === pid) err('ライバルを選んでください');
+    opp = o.id;
+  }
+  p.act.splice(p.act.indexOf(cid), 1);
+  p.r.set.push({ cid, opp });
+  addLog(s, `${p.name} がアクションカードを1枚伏せた`);
+  return s;
+}
+
+export function unsetAction(s, pid, i) {
+  const p = practicing(s, pid);
+  const x = p.r.set[i];
+  if (!x) return s;
+  p.r.set.splice(i, 1);
+  p.act.push(x.cid);
+  return s;
+}
+
 export function setReady(s, pid) {
-  const p = myRound(s, pid);
-  if (!p.r.song) err('課題曲を選んでください');
+  const p = practicing(s, pid);
   p.r.ready = true;
   addLog(s, `${p.name} が準備完了`);
-  if (s.players.every(q => q.r.ready)) resolveMission(s);
+  if (s.players.every(q => q.r.ready)) resolveStage(s);
   return s;
 }
 
 export function cancelReady(s, pid) {
   if (s.phase !== 'practice') return s;
-  const p = getP(s, pid);
-  p.r.ready = false;
+  getP(s, pid).r.ready = false;
   return s;
 }
 
-// ホスト用：未準備の人を自動で準備完了にする
-export function forceReady(s, pid) {
+// ホスト用：止まっている人の代わりに進める
+export function forceAdvance(s, pid) {
   if (!isHost(s, pid)) err('ホストだけが操作できます');
-  if (s.phase !== 'practice') return s;
-  s.players.forEach(p => {
-    if (p.r.ready) return;
-    if (!p.r.song) p.r.song = p.r.songs.reduce((a, b) => (personalScore(s, p, b).score > personalScore(s, p, a).score ? b : a));
-    p.r.ready = true;
-    addLog(s, `ホストが ${p.name} を準備完了にしました`);
-  });
-  resolveMission(s);
+  if (s.phase === 'song') {
+    const by = getP(s, s.songPick.by);
+    addLog(s, `ホストが ${by.name} の代わりに選曲しました`);
+    chooseSong(s, by.id, pick(s.songPick.choices));
+  } else if (s.phase === 'draft') {
+    const d = getP(s, drafter(s));
+    const free = s.draft.pool.filter(c => !s.draft.taken[c]);
+    const best = free.reduce((a, b) => (mateBase(s, b) > mateBase(s, a) ? b : a));
+    const to = hasSlot(d) ? d : s.players.find(hasSlot);
+    addLog(s, `ホストが ${d.name} の代わりに指名しました`);
+    doPick(s, d, best, to);
+  } else if (s.phase === 'practice') {
+    s.players.forEach(p => { p.r.ready = true; });
+    addLog(s, 'ホストがステージを開始しました');
+    resolveStage(s);
+  } else if (s.phase === 'result') {
+    nextMission(s);
+  }
   return s;
 }
 
 // ---------- 採点 ----------
-export function effStats(p) {
-  const o = {};
-  STATS.forEach(k => { o[k] = Math.max(0, p.st[k] + (p.r ? p.r.tmpSt[k] : 0)); });
-  return o;
-}
+const songMult = (so, half) => {
+  const w = { ...so.w };
+  (half || []).forEach(k => { w[k] = w[k] / 2; });
+  return w;
+};
 
-export function personalScore(s, p, songId = p.r.song) {
-  const so = song(songId);
-  if (!so) return { score: 0, base: 0, notes: [], fail: false };
-  const st = effStats(p);
+export function selfScore(s, p, half = []) {
+  const so = curSong(s);
+  const w = songMult(so, half);
   const mk = mainStat(so);
-  const notes = [];
-  let base = STATS.reduce((t, k) => t + so.w[k] * st[k], 0);
-  const perkStat = { vocal: 'vo', dance: 'da', rap: 'ra' }[p.type];
-  if (perkStat && perkStat === mk) { base += 4; notes.push(`${TYPES[p.type].name}+4`); }
-  const d = DIFF[so.diff];
-  const fail = st[mk] < d.need;
-  const mult = fail ? FAIL_MULT : d.mult;
-  if (fail) notes.push(`${STAT_FULL[mk]}${d.need}未満でミス連発…×${FAIL_MULT}`);
-  else if (d.mult > 1) notes.push(`難曲クリア×${d.mult}`);
-  const t = p.r ? p.r.tmp.stage : 0;
-  if (t) notes.push(`補正${t > 0 ? '+' : ''}${t}`);
-  return { score: Math.max(0, Math.round(base * mult) + t), base, mult, fail, need: d.need, main: mk, notes };
+  const base = Math.round(STATS.reduce((t, k) => t + w[k] * p.st[k], 0));
+  const fail = p.st[mk] < needOf(so);
+  return { score: fail ? Math.round(base * FAIL_MULT) : base, base, fail, main: mk };
 }
 
-export function npcScore(s, m, so) {
-  const d = npcDef(s, m.cid);
+export const mateBase = (s, cid) => {
+  const so = curSong(s), d = npcDef(s, cid);
+  return STATS.reduce((t, k) => t + so.w[k] * d[k], 0) * MATE_RATE;
+};
+
+// メンバー1人の評価（roll=true で運要素を判定、false で予想）
+export function mateEval(s, cid, roll = false) {
+  const so = curSong(s), d = npcDef(s, cid);
   const mk = mainStat(so);
-  let sc = STATS.reduce((t, k) => t + so.w[k] * Math.max(0, d[k] + (m.mod?.[k] || 0)), 0);
-  const sk = d.skill;
-  const notes = [];
-  const bonus = (v, why) => { sc += v; notes.push(why); };
-  if (mk === 'vo' && sk === 'メインボーカル') bonus(3, sk);
-  if (mk === 'vo' && sk === 'リードボーカル') bonus(1, sk);
-  if (mk === 'da' && sk === 'メインダンサー') bonus(3, sk);
-  if (mk === 'da' && sk === 'リードダンサー') bonus(1, sk);
-  if (mk === 'ra' && sk === 'ラッパー') bonus(3, sk);
-  if (mk === 'vi' && sk === 'ビジュアル') bonus(3, sk);
-  if (sk === 'オールラウンダー') bonus(2, sk);
-  if (sk === 'センター' || sk === 'リーダー') bonus(2, sk);
-  return { score: sc, notes };
-}
-
-export function teamScore(s, p) {
-  const so = song(p.r.song);
-  const me = personalScore(s, p);
-  const mates = p.r.mates.map(m => ({ cid: m.cid, name: npcDef(s, m.cid).name, ...npcScore(s, m, so) }));
-  mates.forEach(m => { m.score += p.r.tmp.mate; });
-  const total = me.score + mates.reduce((t, m) => t + m.score, 0) + p.r.tmp.team;
-  return { total, me, mates };
-}
-
-const GRADES = [[36, 'A', 800], [30, 'B', 400], [24, 'C', 200], [18, 'D', 0], [12, 'E', 0], [0, 'F', 0]];
-
-function resolveMission(s) {
-  const M = mission(s);
-  const rows = s.players.map(p => {
-    const r = p.r;
-    const so = song(r.song);
-    const ts = teamScore(s, p);
-    const items = [];
-    if (r.early) items.push({ label: '練習期間の話題', v: r.early, already: true });
-    const noise = 0.9 + Math.random() * 0.2;
-    const perf = round10(ts.me.score * VOTE_RATE * M.mult * noise);
-    items.push({ label: `個人パフォーマンス（${ts.me.score}点）`, v: perf });
-    let rival = null, win = null, grade = '';
-    if (s.mission === 1) {
-      const g = GRADES.find(x => ts.me.score >= x[0]);
-      grade = g[1];
-      p.grade = grade;
-      if (g[2]) items.push({ label: `${grade}クラス判定`, v: g[2] });
-    }
-    if (M.rival) {
-      const rv = pickMates(s, M.team + 1, r.mates.map(m => m.cid));
-      const rs = rv.reduce((t, m) => t + npcScore(s, m, so).score, 0) + rand(8);
-      rival = { names: rv.map(m => npcDef(s, m.cid).name), score: rs };
-      win = ts.total >= rs;
-      if (win) items.push({ label: 'チーム勝利ベネフィット', v: round10(1000 * M.mult) });
-    }
-    if (M.pos) {
-      const top = ts.mates.every(m => ts.me.score > m.score);
-      if (top) items.push({ label: 'ポジション内1位ボーナス', v: round10(1000 * M.mult) });
-    }
-    const mk = r.mates.filter(m => npcDef(s, m.cid).skill === 'マンネ').length;
-    if (mk) items.push({ label: `マンネの応援×${mk}`, v: 200 * mk });
-    if (p.type === 'visual') {
-      const sub = items.filter(i => !i.already).reduce((t, i) => t + i.v, 0);
-      items.push({ label: 'ビジュアル型+15%', v: round10(sub * 0.15) });
-    }
-    const gain = items.filter(i => !i.already).reduce((t, i) => t + i.v, 0);
-    p.fans += gain;
-    return {
-      pid: p.id, name: p.name, type: p.type, song: r.song, hap: r.hap, hapDetail: r.hapDetail || '',
-      me: ts.me, mates: ts.mates, total: ts.total, rival, win, grade, items,
-      gain: gain + r.early,
-    };
-  });
-  // NPCの得票
-  activeNpcs(s).forEach(id => {
-    const d = npcDef(s, id), n = s.npc[id];
-    const sum = d.vo + d.da + d.ra + d.vi;
-    const sc = sum * 2 + (s.mission - 1) * 8 + (d.star ? 6 : 0); // NPCも課題ごとに成長する
-    n.fans += round10(sc * VOTE_RATE * M.mult * n.pop * (0.7 + Math.random() * 0.6));
-  });
-  rows.sort((a, b) => b.gain - a.gain);
-  s.results = { mission: s.mission, rows };
-  calcRanking(s);
-  // 脱落
-  const cut = ELIM[s.mission];
-  let eliminated = [];
-  if (cut) {
-    s.ranking.forEach(e => {
-      if (e.kind === 'n' && e.rank > cut && !s.npc[e.id].out) { s.npc[e.id].out = s.mission; eliminated.push(e.name); }
-    });
-    calcRanking(s);
+  let v = mateBase(s, cid);
+  const r = { cid, name: d.name, trait: d.trait, team: 0, votes: 0, note: '', risk: '' };
+  switch (d.trait) {
+    case 'mood': v *= 0.5; r.team += 4; break;
+    case 'genius':
+      if (roll && rand(3) === 0) { v = 0; r.note = '大ミス…'; } else v *= 2;
+      if (!roll) r.risk = '1/3で大ミス';
+      break;
+    case 'diva': v *= 1.5; r.team -= 4; break;
+    case 'nervous':
+      if (roll && rand(2) === 0) { v *= 0.5; r.note = '緊張で実力を出せず…'; }
+      if (!roll) r.risk = '1/2で半分';
+      break;
+    case 'hard': v += s.mission * 2; break;
+    case 'visual': v += mk === 'vi' ? 6 : -2; break;
+    case 'rapper': v += mk === 'ra' ? 6 : -2; break;
+    case 'leader': v -= 2; r.team += 3; break;
+    case 'maknae': v *= 0.5; r.votes += 1; break;
+    case 'clumsy': r.team -= 5; r.votes += 2; break;
+    case 'trouble': if (!roll) r.risk = '悪いハプニングが起きやすい'; break;
+    default: break;
   }
-  s.results.eliminated = eliminated;
-  s.results.cut = cut || 0;
-  s.history.push({ mission: s.mission, ranks: s.players.map(p => ({ pid: p.id, rank: p.rank, fans: p.fans })) });
+  r.v = Math.max(0, Math.round(v));
+  return r;
+}
+
+export function predict(s, p) {
+  const me = selfScore(s, p);
+  const mates = p.r.mates.map(c => mateEval(s, c));
+  const team = mates.reduce((t, m) => t + m.v + m.team, 0);
+  return { ...me, mates, team, total: me.score + team };
+}
+
+function rollHap(pressure, trouble) {
+  const list = pressure ? HAPPS.filter(h => h.bad) : HAPPS;
+  let total = 0;
+  const ws = list.map(h => { const w = h.w * (h.bad && trouble ? 3 : 1); total += w; return w; });
+  let x = Math.random() * total;
+  return list.find((h, i) => (x -= ws[i]) < 0) || list[0];
+}
+
+function resolveStage(s) {
+  const M = mission(s);
+  const P = id => getP(s, id);
+  const st = {};
+  s.players.forEach(p => {
+    st[p.id] = { ev: [], pts: 0, votes: 0, half: [], pressure: false, teamwork: false, defs: [], penalty: 0 };
+    p.r.set.forEach(x => {
+      const k = CARDS[x.cid].kind;
+      if (k === 'guard' || k === 'counter') st[p.id].defs.push(k);
+    });
+  });
+  // ① 妨害の判定（防御カードで順に防ぐ）
+  const attacks = [];
+  s.players.forEach(p => p.r.set.forEach(x => { if (x.opp) attacks.push({ from: p.id, to: x.opp, kind: CARDS[x.cid].kind, name: CARDS[x.cid].name, icon: CARDS[x.cid].icon }); }));
+  shuffle(attacks);
+  const hits = [];
+  attacks.forEach(a => {
+    const t = st[a.to];
+    const def = t.defs.shift();
+    if (def) {
+      t.ev.push({ t: `🛡️ ${P(a.from).name} の「${a.name}」を${def === 'counter' ? 'カウンターで返り討ち！' : '警護で防いだ'}`, good: true });
+      st[a.from].ev.push({ t: `${a.icon} ${P(a.to).name} への「${a.name}」は防がれた…`, bad: true });
+      if (def === 'counter') { st[a.from].pts -= 5; st[a.from].ev.push({ t: `⚡ ${P(a.to).name} のカウンター`, v: -5, bad: true }); }
+    } else hits.push(a);
+  });
+  // ② メンバー交換（スコア計算の前に入れ替え）
+  hits.filter(a => a.kind === 'swap').forEach(a => {
+    const me = P(a.from), op = P(a.to);
+    if (!me.r.mates.length || !op.r.mates.length) return;
+    const val = c => mateEval(s, c).v + mateEval(s, c).team;
+    const mine = me.r.mates.reduce((x, y) => (val(y) < val(x) ? y : x));
+    const theirs = op.r.mates.reduce((x, y) => (val(y) > val(x) ? y : x));
+    me.r.mates[me.r.mates.indexOf(mine)] = theirs;
+    op.r.mates[op.r.mates.indexOf(theirs)] = mine;
+    st[a.from].ev.push({ t: `🔄 ${op.name} の ${npcDef(s, theirs).name} と ${npcDef(s, mine).name} を交換`, good: true });
+    st[a.to].ev.push({ t: `🔄 ${me.name} に ${npcDef(s, theirs).name} を奪われ、${npcDef(s, mine).name} が来た`, bad: true });
+  });
+  // ③ そのほかの妨害の効果
+  hits.forEach(a => {
+    const f = st[a.from], t = st[a.to], fn = P(a.from).name, tn = P(a.to).name;
+    switch (a.kind) {
+      case 'steal': t.pts -= 5; f.pts += 3; t.ev.push({ t: `🎯 ${fn} にパートを奪われた`, v: -5, bad: true }); f.ev.push({ t: `🎯 ${tn} のパートを奪った`, v: 3, good: true }); break;
+      case 'devil': t.votes -= 2; t.ev.push({ t: `😈 ${fn} の悪魔の編集`, votes: -2, bad: true }); f.ev.push({ t: `😈 ${tn} に悪魔の編集が成功`, good: true }); break;
+      case 'sound': t.half.push('vo', 'ra'); t.ev.push({ t: `🔇 ${fn} の音響トラブル（ボーカル・ラップ半分）`, bad: true }); f.ev.push({ t: `🔇 ${tn} に音響トラブルが成功`, good: true }); break;
+      case 'costume': t.half.push('da', 'vi'); t.ev.push({ t: `👗 ${fn} の衣装トラブル（ダンス・ビジュアル半分）`, bad: true }); f.ev.push({ t: `👗 ${tn} に衣装トラブルが成功`, good: true }); break;
+      case 'pressure': t.pressure = true; t.ev.push({ t: `😱 ${fn} からのプレッシャー`, bad: true }); f.ev.push({ t: `😱 ${tn} にプレッシャーが成功`, good: true }); break;
+      default: break;
+    }
+  });
+  // ④ 強化カード
+  const maxRank = Math.max(...s.players.map(p => p.rank));
+  s.players.forEach(p => {
+    const x = st[p.id];
+    p.r.set.forEach(c => {
+      const k = CARDS[c.cid].kind;
+      if (k === 'killing') { x.pts += 6; x.ev.push({ t: '✨ キリングパート', v: 6, good: true }); }
+      if (k === 'fancam') { x.votes += 2; x.ev.push({ t: '📱 直カム撮影', votes: 2, good: true }); }
+      if (k === 'teamwork') x.teamwork = true;
+      if (k === 'comeback') {
+        if (s.mission > 1 && maxRank > 1 && p.rank === maxRank) { x.votes += 4; x.ev.push({ t: '💥 一発逆転（最下位から）', votes: 4, good: true }); }
+        else x.ev.push({ t: '💥 一発逆転…最下位ではなかった' });
+      }
+      if (k === 'priority') { s.priority.push(p.id); x.ev.push({ t: '👆 次の課題で優先指名権', good: true }); }
+    });
+  });
+  // ⑤ ステージ点
+  const rows = s.players.map(p => {
+    const x = st[p.id];
+    const me = selfScore(s, p, x.half);
+    const mates = p.r.mates.map(c => mateEval(s, c, true));
+    let team = 0;
+    mates.forEach(m => {
+      const v = x.teamwork ? Math.round(m.v * 1.5) : m.v;
+      team += v + m.team;
+      x.votes += m.votes;
+      const tr = TRAITS[m.trait];
+      if (m.note) x.ev.push({ t: `${m.name}（${tr.name}）${m.note}`, bad: true });
+      if (m.team) x.ev.push({ t: `${m.name}（${tr.name}）`, v: m.team, bad: m.team < 0, good: m.team > 0 });
+      if (m.votes) x.ev.push({ t: `${m.name}（${tr.name}）`, votes: m.votes, good: true });
+    });
+    if (x.teamwork) x.ev.push({ t: '🤝 チームワークでメンバーの点1.5倍', good: true });
+    const trouble = p.r.mates.some(c => npcDef(s, c).trait === 'trouble');
+    const h = rollHap(x.pressure, trouble);
+    if (h.v) x.ev.push({ t: `${h.icon} ${h.name}`, v: h.v, bad: h.v < 0, good: h.v > 0 });
+    if (h.votes) { x.votes += h.votes; x.ev.push({ t: `${h.icon} ${h.name}`, votes: h.votes, good: true }); }
+    const total = Math.max(0, me.score + team + x.pts + h.v);
+    return { pid: p.id, name: p.name, self: me.score, fail: me.fail, team, mates: p.r.mates.map((c, i) => ({ cid: c, v: mates[i].v })), total, ev: x.ev, extra: x.votes };
+  });
+  // ⑥ 順位と得票
+  const table = VOTES[s.players.length] || VOTES[4];
+  rows.forEach(r => {
+    r.rank = 1 + rows.filter(o => o.total > r.total).length;
+    r.place = (table[r.rank - 1] || 0) * M.mult;
+    r.gain = r.place + r.extra;
+    const p = getP(s, r.pid);
+    p.votes = Math.max(0, p.votes + r.gain);
+  });
+  rows.sort((a, b) => a.rank - b.rank);
+  s.players.forEach(p => {
+    p.rank = 1 + s.players.filter(o => o.votes > p.votes).length;
+    p.r.set.forEach(x => s.adiscard.push(x.cid));
+    p.r.set = [];
+  });
+  s.results = { mission: s.mission, song: s.song, rows };
+  s.history.push({ mission: s.mission, rows: rows.map(r => ({ pid: r.pid, rank: r.rank, total: r.total })) });
   s.phase = 'result';
   s.ready = {};
-  addLog(s, `第${s.mission}課題「${M.name}」結果発表：` + s.players.map(p => `${p.name} ${p.rank}位`).join(' / '));
-  if (eliminated.length) addLog(s, `${eliminated.length}人の練習生が脱落しました`);
+  addLog(s, `第${s.mission}課題の結果：` + rows.map(r => `${r.rank}位 ${r.name}（${r.total}点）`).join(' / '));
 }
 
-// 全練習生の順位（脱落者は下位に固定）
-function calcRanking(s) {
-  const list = [
-    ...s.players.map(p => ({ kind: 'p', id: p.id, name: p.name, fans: p.fans, out: 0 })),
-    ...Object.keys(s.npc).map(id => ({ kind: 'n', id, name: npcDef(s, id).name, fans: s.npc[id].fans, out: s.npc[id].out })),
-  ];
-  list.sort((a, b) => (a.out ? 1 : 0) - (b.out ? 1 : 0) || (b.out - a.out) || b.fans - a.fans);
-  list.forEach((e, i) => {
-    e.rank = i + 1;
-    const o = e.kind === 'p' ? getP(s, e.id) : s.npc[e.id];
-    e.prev = o.rank || 0;
-    o.prevRank = o.rank || 0;
-    o.rank = e.rank;
-  });
-  s.ranking = list;
-}
-
-export function readyNext(s, pid, force = false) {
+export function readyNext(s, pid) {
   if (s.status !== 'playing' || s.phase !== 'result') return s;
-  if (force && !isHost(s, pid)) err('ホストだけが操作できます');
   s.ready[pid] = true;
-  if (force || s.players.every(p => s.ready[p.id])) {
-    if (s.mission >= WEEKS) finish(s);
-    else startMission(s);
-  }
+  if (s.players.every(p => s.ready[p.id])) nextMission(s);
   return s;
+}
+
+function nextMission(s) {
+  if (s.mission >= WEEKS) finish(s);
+  else startMission(s);
 }
 
 function finish(s) {
   s.status = 'ended';
   s.phase = 'ended';
-  s.final = [...s.players].sort((a, b) => a.rank - b.rank).map(p => ({ pid: p.id, name: p.name, fans: p.fans, rank: p.rank, debut: p.rank <= DEBUT }));
-  s.debut = s.ranking.slice(0, DEBUT).map(e => ({ kind: e.kind, id: e.id, name: e.name, fans: e.fans }));
-  addLog(s, `🎉 最終順位発表！ 1位は ${s.ranking[0].name}`);
+  s.final = [...s.players].sort((a, b) => b.votes - a.votes).map(p => ({ pid: p.id, name: p.name, votes: p.votes, rank: p.rank }));
+  addLog(s, `🎉 最終順位発表！ デビューを決めたのは ${s.final.filter(f => f.rank === 1).map(f => f.name).join('・')}！`);
 }
 
 export function backToLobby(s, pid) {
   if (!isHost(s, pid)) err('ホストだけが操作できます');
   return {
-    v2: true, roomId: s.roomId, status: 'lobby', hostId: s.hostId, custom: s.custom || [], created: s.created, log: [],
+    v: 4, roomId: s.roomId, status: 'lobby', hostId: s.hostId, custom: s.custom || [], created: s.created, log: [],
     players: s.players.map(p => ({ id: p.id, name: p.name, type: p.type })),
   };
 }

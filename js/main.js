@@ -1,8 +1,8 @@
 // ===== 画面・操作 =====
 import * as G from './game.js';
 import {
-  STATS, STAT_NAMES, STAT_FULL, TYPES, MISSIONS, SONGS, DIFF, FAIL_MULT, CARDS, HAPPS,
-  SKILL_DESC, SKILL_LIST, SKILL_TONE, FLAGS, DEBUT, ELIM,
+  STATS, STAT_NAMES, STAT_SHORT, TYPES, MISSIONS, SONGS, FAIL_MULT, VOTES, CARDS, ACTION_TYPES, TARGETED,
+  TRAITS, HAPPS, FLAGS, TEAM_SIZE,
 } from './cards.js';
 import * as Store from './store.js';
 
@@ -15,7 +15,7 @@ const store = (k, area = localStorage) => ({
 const pidStore = store('dm_pid', sessionStorage);
 const roomStore = store('dm_room', sessionStorage);
 const nameStore = store('dm_name');
-const savedCustomStore = store('dm_my_customs2');
+const savedCustomStore = store('dm_my_customs4');
 
 let pid = pidStore.get() || ('p' + Math.random().toString(36).slice(2, 10));
 pidStore.set(pid);
@@ -26,7 +26,8 @@ let unsub = null;
 const ui = {
   form: { name: nameStore.get() || '', room: new URLSearchParams(location.search).get('room') || '' },
   sheet: null,
-  resultStep: 0,      // 結果モーダル：0=ステージ結果 1=順位発表
+  tab: 'train',        // 手札タブ：train / act
+  songSel: null,       // 選曲中の候補
   closedResult: 0,
   busy: false,
 };
@@ -38,10 +39,10 @@ const isNew = key => (seen.has(key) ? '' : (seen.add(key), ' new'));
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hue = str => { let h = 0; for (const ch of String(str)) h = (h * 31 + ch.codePointAt(0)) % 360; return h; };
 const avatar = (name, cls = '') => `<span class="avatar ${cls}" style="--h:${hue(name)}">${esc([...String(name)][0] || '?')}</span>`;
-const num = v => Number(v || 0).toLocaleString('ja-JP');
-const signed = v => (v >= 0 ? '+' : '−') + num(Math.abs(v));
 const me = () => S && S.players.find(p => p.id === pid);
 const stars = d => '★'.repeat(d) + '☆'.repeat(3 - d);
+const sv = v => (v > 0 ? `+${v}` : `${v}`);
+const pname = id => (id === pid ? 'あなた' : esc(G.getP(S, id)?.name || ''));
 
 function toast(msg, type = '') {
   const box = document.getElementById('toasts');
@@ -64,41 +65,60 @@ async function act(fn) {
 }
 
 // ---------- 部品 ----------
-function statRow(k, v, mod = 0, max = 9) {
-  return `<div class="st ${k}"><span class="lb">${STAT_NAMES[k]}</span><span class="bar"><i style="width:${Math.min(100, Math.max(0, v + mod) / max * 100)}%"></i></span><span class="n">${Math.max(0, v + mod)}${mod ? `<sup class="${mod < 0 ? 'neg' : ''}">${mod > 0 ? '+' : ''}${mod}</sup>` : ''}</span></div>`;
+function statBar(k, v, max, need = 0) {
+  const needMark = need ? `<span class="need" style="left:${Math.min(100, need / max * 100)}%"></span>` : '';
+  return `<div class="sbar ${k} ${need && v < need ? 'short' : ''}"><span class="lb">${STAT_NAMES[k]}</span><span class="bar"><i style="width:${Math.min(100, v / max * 100)}%"></i>${needMark}</span><b>${v}</b></div>`;
 }
 
-// NPC練習生カード
-function tcard(d, o = {}) {
-  const tone = SKILL_TONE[d.skill] || 'etc';
-  const mod = o.mod || {};
-  const flag = d.country ? `<span class="flag">${FLAGS[d.country] || '🌏'}</span>` : '';
+function weightChips(so) {
+  const mk = G.mainStat(so);
+  return STATS.filter(k => so.w[k]).map(k => `<span class="w ${k}${k === mk ? ' main' : ''}">${STAT_NAMES[k]}×${so.w[k]}</span>`).join('');
+}
+
+// メンバーカード（特徴の利点・デメリット付き）
+function memberCard(d, o = {}) {
+  const tr = TRAITS[d.trait] || TRAITS.leader;
   const attrs = o.act ? `data-act="${o.act}" data-cid="${d.id}"` : '';
   const Tag = o.act ? 'button' : 'div';
-  return `<${Tag} class="tcard tone-${tone}${o.cls || ''}" ${attrs}>
-    <div class="band"><span class="face" style="--h:${hue(d.name)}">${esc([...d.name][0])}</span>${flag}${d.star ? '<span class="star">★</span>' : ''}</div>
-    ${o.badge ? `<span class="badge ${o.badgeCls || ''}">${esc(o.badge)}</span>` : ''}
-    <div class="nm">${esc(d.name)}</div>
-    <div class="sk">${esc(d.skill)}${d.custom ? '・自作' : ''}</div>
-    <div class="stats">${STATS.map(k => statRow(k, d[k], mod[k] || 0, 9)).join('')}</div>
+  const flag = d.country ? `<span class="flag">${FLAGS[d.country] || '🌏'}</span>` : '';
+  return `<${Tag} class="mcard${o.cls || ''}" ${attrs}>
+    <div class="mc-hd">${avatar(d.name)}<span class="nm">${esc(d.name)}</span>${flag}</div>
+    <div class="mc-st">${STATS.map(k => `<span class="${k}">${STAT_SHORT[k]}<b>${d[k]}</b></span>`).join('')}</div>
+    <div class="mc-tr">${esc(tr.name)}</div>
+    <div class="mc-pm"><span class="p">＋${esc(tr.plus)}</span><span class="m">－${esc(tr.minus)}</span></div>
+    ${o.foot || ''}
   </${Tag}>`;
 }
+function mateFoot(cid) {
+  const e = G.mateEval(S, cid);
+  const total = e.v + e.team;
+  return `<div class="mc-ft">この曲で <b>${total}</b>点${e.votes ? ` ＋${e.votes}万票` : ''}${e.risk ? `<small>⚠${esc(e.risk)}</small>` : ''}</div>`;
+}
 
-// 練習カード
-function kcard(c, o = {}) {
+function cardView(c, o = {}) {
   const attrs = o.act ? `data-act="${o.act}" data-cid="${c.id}"` : '';
   const Tag = o.act ? 'button' : 'div';
-  return `<${Tag} class="ccard lesson${o.cls || ''}" ${attrs}>
-    <span class="ty">TRAINING</span>
+  const label = c.cat === 'train' ? '練習' : ACTION_TYPES[c.type];
+  const cls = c.cat === 'train' ? 'train' : `act-${c.type}`;
+  return `<${Tag} class="kcard ${cls}${o.cls || ''}" ${attrs}>
+    <span class="ty">${label}</span>
     <div class="ico">${c.icon}</div>
     <div class="nm">${esc(c.name)}</div>
     <div class="ef">${esc(c.eff)}</div>
   </${Tag}>`;
 }
 
-function weightChips(so) {
+function songCard(id, o = {}) {
+  const so = SONGS[id];
   const mk = G.mainStat(so);
-  return STATS.filter(k => so.w[k] > 0).map(k => `<span class="wchip-s ${k}${k === mk ? ' main' : ''}">${STAT_NAMES[k]}×${so.w[k]}</span>`).join('');
+  const need = G.needOf(so);
+  return `<button class="song ${o.sel ? 'sel' : ''}" ${o.act ? `data-act="${o.act}" data-v="${id}"` : ''}>
+    <div class="song-top"><span>${esc(so.genre)}</span><span class="diff d${so.diff}">${stars(so.diff)}</span></div>
+    <div class="song-nm">♪ ${esc(so.name)}</div>
+    <div class="wrow">${weightChips(so)}</div>
+    <div class="song-need ${need ? '' : 'ok'}">${need ? `${STAT_NAMES[mk]}${need}未満はミス` : '初心者向け'}</div>
+    ${o.foot || ''}
+  </button>`;
 }
 
 // ---------- 描画 ----------
@@ -120,200 +140,182 @@ function render() {
 function viewEntry() {
   return `<div class="entry">
     <div class="logo">
-      <div class="logo-sub">SURVIVAL AUDITION GAME</div>
+      <div class="logo-sub">サバイバルオーディション</div>
       <h1>デビューまで<br><span>あと1ステージ</span></h1>
       <div class="logo-stars">★ ★ ★</div>
-      <p class="hint" style="margin-top:10px">あなたはサバイバル番組の練習生。<br>5つの課題を乗り越えて、デビュー組（上位${DEBUT}人）を目指せ！</p>
+      <p class="hint">練習生になって、ライバルと同じ課題曲で勝負。<br>5つの課題で一番票を集めた人がデビュー！</p>
     </div>
     <div class="panel">
-      <label for="in-name">練習生としての名前</label>
+      <label for="in-name">あなたの名前</label>
       <input id="in-name" class="field" data-bind="name" maxlength="10" placeholder="例：くりす" value="${esc(ui.form.name)}" autocomplete="off">
       <label for="in-room">ルームID</label>
       <div class="row">
         <input id="in-room" class="field" data-bind="room" maxlength="12" placeholder="例：K7Q2" value="${esc(ui.form.room)}" autocomplete="off" autocapitalize="characters">
         <button class="btn" data-act="genRoom">🎲 作成</button>
       </div>
-      <p class="hint">同じルームIDを入力した人同士で対戦します（1〜4人。1人でもNPC練習生と競えます）。部屋がなければ新しく作られます。</p>
+      <p class="hint">同じルームIDを入力した人同士で対戦します（2〜4人）。部屋がなければ新しく作られます。</p>
       <button class="btn primary big" data-act="enter" ${ui.busy ? 'disabled' : ''}>${ui.busy ? '接続中…' : '番組に参加する'}</button>
     </div>
-    <button class="btn link" data-act="rules">📖 ルールを見る</button>
+    <button class="btn link" data-act="rules">📖 遊び方を見る</button>
     <div class="mode-badge ${Store.isOnline ? '' : 'local'}">
-      ${Store.isOnline ? '<b>● オンライン</b>（Firebase接続）' : '<b>● ローカルテストモード</b><br>Firebase未設定のため、同じブラウザの別タブ同士でのみ遊べます'}
+      ${Store.isOnline ? '<b>● オンライン</b>（Firebase接続中）' : '<b>● ローカルテストモード</b><br>同じブラウザの別タブ同士でのみ遊べます'}
     </div>
   </div>`;
 }
 
-// ===== ロビー =====
+// ===== 待機室 =====
 function viewLobby() {
   const host = G.isHost(S, pid);
   const my = me();
   const n = S.players.length;
-  const slots = [];
-  for (let i = 0; i < 4; i++) {
-    const p = S.players[i];
-    const t = p && TYPES[p.type];
-    slots.push(p
-      ? `<div class="pitem">${avatar(p.name)}<span class="nm">${esc(p.name)}<small>${t.icon} ${t.name}</small></span>
-          ${p.id === S.hostId ? '<span class="tag">👑 ホスト</span>' : ''}${p.id === pid ? '<span class="tag">あなた</span>' : ''}</div>`
-      : '<div class="pitem empty"><span class="avatar" style="--h:260">?</span><span class="nm">募集中…</span></div>');
-  }
+  const list = S.players.map(p => {
+    const t = TYPES[p.type];
+    return `<div class="pitem">${avatar(p.name)}<span class="nm">${esc(p.name)}<small>${t.icon} ${t.name}</small></span>
+      ${p.id === S.hostId ? '<span class="tag">👑 ホスト</span>' : ''}${p.id === pid ? '<span class="tag me">あなた</span>' : ''}</div>`;
+  }).join('');
   const types = Object.values(TYPES).map(t => `<button class="type-opt ${my.type === t.id ? 'sel' : ''}" data-act="setType" data-v="${t.id}">
       <span class="ti">${t.icon}</span><b>${t.name}</b>
-      <span class="ts">${STATS.map(k => `${STAT_NAMES[k]}${t.st[k]}`).join(' ')}</span>
-      <small>${esc(t.perk)}</small></button>`).join('');
-  const customs = (S.custom || []).map(c => `<div style="position:relative">
-      ${(c.owner === pid || host) ? `<button class="del-x" data-act="delCustom" data-id="${c.id}" aria-label="削除">✕</button>` : ''}
-      ${tcard(c, { act: 'viewNpc' })}</div>`).join('');
+      <span class="ts">${STATS.map(k => `${STAT_SHORT[k]}${t.st[k]}`).join(' ')}</span></button>`).join('');
+  const customs = (S.custom || []).map(c => `<div class="custom-item">${memberCard(c)}${(c.owner === pid || host) ? `<button class="del-x" data-act="delCustom" data-id="${c.id}" aria-label="削除">✕</button>` : ''}</div>`).join('');
   const saved = savedCustoms().filter(sc => !(S.custom || []).some(c => c.name === sc.name));
   return `<div class="lobby">
-    <div class="topbar"><button class="icon-btn" data-act="leave" aria-label="退出">←</button><div class="title">待機室</div><button class="icon-btn" data-act="rules" aria-label="ルール">📖</button></div>
-    <div class="room-card"><div class="lbl">ROOM ID</div><div class="room-id">${esc(roomId)}</div>
-      <button class="btn small" data-act="share">🔗 招待リンクを共有</button></div>
-    <section><h3>あなたのタイプを選ぶ <small>最初の能力と特性が決まります</small></h3><div class="type-grid">${types}</div></section>
-    <section><h3>参加プレイヤー <small>${n}/4人</small></h3><div class="plist">${slots.join('')}</div></section>
-    <section><h3>オリジナル練習生 <small>番組のほかの参加者として登場（${(S.custom || []).length}/${G.MAX_CUSTOM}）</small></h3>
-      ${customs ? `<div class="custom-list">${customs}</div>` : '<p class="hint">名前・能力値・特技を決めて、番組に出てくる練習生を追加できます。チームメイトやライバルとして登場します。</p>'}
-      <div style="margin-top:10px"><button class="btn" style="width:100%" data-act="openCustom">＋ 練習生を作る</button></div>
-      ${saved.length ? `<p class="hint" style="margin-top:12px">前に作った練習生をタップで追加：</p><div class="saved-chips">${saved.map((c, i) => `<button class="opt" data-act="addSaved" data-i="${i}">${esc(c.name)} <small>${c.vo}/${c.da}/${c.ra}/${c.vi}</small></button>`).join('')}</div>` : ''}
+    <div class="topbar"><button class="icon-btn" data-act="leave" aria-label="退出">←</button><div class="title">待機室</div><button class="icon-btn" data-act="rules" aria-label="遊び方">📖</button></div>
+    <div class="room-card"><div class="lbl">ルームID</div><div class="room-id">${esc(roomId)}</div>
+      <button class="btn small" data-act="share">🔗 招待リンクを送る</button></div>
+    <section><h3>参加者 <small>${n}/4人</small></h3><div class="plist">${list}</div>
+      ${n < 2 ? '<p class="hint" style="margin-top:8px">招待リンクを送って、友だちを呼びましょう（2人から遊べます）。</p>' : ''}</section>
+    <section><h3>あなたのタイプ <small>最初の能力が決まります</small></h3><div class="type-grid">${types}</div></section>
+    <section><h3>オリジナル練習生 <small>ステージメンバーの候補に登場</small></h3>
+      ${customs ? `<div class="m-grid two">${customs}</div>` : ''}
+      <button class="btn small" data-act="openCustom">＋ 練習生を作る</button>
+      ${saved.length ? `<div class="saved-chips">${saved.map((c, i) => `<button class="chip" data-act="addSaved" data-i="${i}">＋ ${esc(c.name)}</button>`).join('')}</div>` : ''}
     </section>
     <div class="bottom-bar">${host
-      ? `<button class="btn primary big" data-act="start">${n === 1 ? '1人で番組スタート！' : `${n}人で番組スタート！`}</button>`
+      ? `<button class="btn primary big" data-act="start" ${n < 2 ? 'disabled' : ''}>${n < 2 ? 'あと1人以上必要です' : `${n}人で番組スタート！`}</button>`
       : '<div class="waiting">ホストの開始を待っています<span class="dots"></span></div>'}</div>
   </div>`;
 }
 function savedCustoms() { try { return JSON.parse(savedCustomStore.get() || '[]'); } catch { return []; } }
 
 // ===== ゲーム =====
-function rankBadge(rank, prev) {
-  const diff = prev ? prev - rank : 0;
-  const arrow = diff > 0 ? `<i class="up">▲${diff}</i>` : diff < 0 ? `<i class="down">▼${-diff}</i>` : '';
-  return `<span class="rank-b ${rank <= DEBUT ? 'in' : ''}">${rank}<small>位</small>${arrow}</span>`;
+function playerState(p) {
+  if (S.phase === 'song') return S.songPick.by === p.id ? '<span class="pst on">選曲中</span>' : '';
+  if (S.phase === 'draft') return G.drafter(S) === p.id ? '<span class="pst on">指名中</span>' : `<span class="pst">${p.r.mates.length}/${TEAM_SIZE}人</span>`;
+  if (S.phase === 'practice') return p.r.ready ? '<span class="pst ok">準備OK</span>' : '<span class="pst">練習中</span>';
+  if (S.phase === 'result') return S.ready[p.id] ? '<span class="pst ok">OK</span>' : '';
+  return '';
+}
+
+function scoreboard() {
+  const sorted = [...S.players].sort((a, b) => a.rank - b.rank || b.votes - a.votes);
+  const max = Math.max(1, ...sorted.map(p => p.votes));
+  return `<div class="board">${sorted.map(p => `<button class="brow ${p.id === pid ? 'me' : ''}" data-act="viewPlayer" data-id="${p.id}">
+      <span class="brk r${p.rank}">${p.rank}</span>${avatar(p.name)}
+      <span class="bnm">${esc(p.name)}${p.id === pid ? '<small>あなた</small>' : ''}</span>
+      <span class="bvbar"><i style="width:${p.votes / max * 100}%"></i></span>
+      <span class="bv">${p.votes}<small>万票</small></span>${playerState(p)}
+    </button>`).join('')}</div>`;
+}
+
+function songPanel() {
+  const so = G.curSong(S);
+  return `<div class="songp${enter('song:' + S.mission)}">
+    <div class="songp-k">今回の課題曲 <span class="diff d${so.diff}">${stars(so.diff)}</span></div>
+    <div class="songp-nm">♪ ${esc(so.name)}</div>
+    <div class="wrow">${weightChips(so)}</div>
+  </div>`;
 }
 
 function viewGame() {
   const my = me();
   if (!my) return '<div class="waiting">観戦できません</div>';
   const M = G.mission(S);
-  const r = my.r;
-  const total = S.ranking.length;
-  const lastLog = (S.log || []).slice(-1)[0];
-  const practice = S.phase === 'practice';
-
-  const opps = S.players.filter(p => p.id !== pid).map(p => {
-    let state = '';
-    if (practice) state = p.r.ready ? '<span class="state ok">✓ 準備OK</span>' : '<span class="state">練習中</span>';
-    else if (S.phase === 'result' && S.ready[p.id]) state = '<span class="state ok">✓ OK</span>';
-    return `<button class="opp" data-act="viewOpp" data-id="${p.id}">
-      ${state}<div class="top">${avatar(p.name)}<span class="nm">${esc(p.name)}</span></div>
-      <div class="fans">${p.rank}<small>位</small> <span class="sm">${num(p.fans)}票</span></div>
-      <div class="meta"><span>${TYPES[p.type].icon} ${TYPES[p.type].name}</span></div>
-    </button>`;
-  }).join('');
-
   const progress = MISSIONS.map(m => `<i class="${m.n < S.mission ? 'done' : m.n === S.mission ? 'now' : ''}"></i>`).join('');
-
-  // バナー
-  let banner;
-  if (practice && !r.ready) {
-    banner = `<div class="phase-banner mine"><span class="ic">${M.icon}</span><div><div class="t">第${S.mission}課題「${M.name}」</div><div class="s">${esc(M.desc)}</div></div></div>`;
-  } else if (practice) {
-    const cnt = S.players.filter(p => p.r.ready).length;
-    banner = `<div class="phase-banner"><span class="ic">⏳</span><div><div class="t">準備完了！ ステージ待機中<span class="dots"></span></div><div class="s">ほかの練習生を待っています（${cnt}/${S.players.length}）</div></div></div>`;
-  } else if (S.phase === 'result') {
-    banner = `<div class="phase-banner"><span class="ic">📺</span><div><div class="t">第${S.mission}課題の結果発表！</div><div class="s">全員がOKすると次の課題へ進みます</div></div></div>`;
-  } else {
-    banner = '<div class="phase-banner"><span class="ic">🏁</span><div><div class="t">最終順位発表！</div></div></div>';
-  }
-
-  // 自分
-  const tmp = r ? r.tmpSt : {};
-  const meCard = `<div class="me-card">
-    <div class="me-top">${avatar(my.name, 'lg')}
-      <div class="nm">${esc(my.name)}<small>${TYPES[my.type].icon} ${TYPES[my.type].name}${my.grade ? `・<b class="grade g${my.grade}">${my.grade}</b>クラス` : ''}</small></div>
-      <div class="me-rank">${rankBadge(my.rank, my.prevRank)}<small>${num(my.fans)}票 / ${total}人中</small></div>
-    </div>
-    <div class="me-stats">${STATS.map(k => statRow(k, my.st[k], tmp[k] || 0, 15)).join('')}</div>
-    <div class="perk">✦ ${esc(TYPES[my.type].perk)}</div>
-  </div>`;
-
-  let missionHtml = '';
-  if (r && S.status === 'playing') {
-    const h = HAPPS[r.hap];
-    const hap = `<div class="hap-card${enter('hap:' + S.mission)}"><span class="hi">${h.icon}</span><div><div class="hk">HAPPENING</div><b>${esc(h.name)}</b><div class="he">${esc(h.eff)}${r.hapDetail ? `<br><span>→ ${esc(r.hapDetail)}</span>` : ''}</div></div></div>`;
-    const notes = r.notes.length ? `<div class="hint" style="margin:-4px 2px 10px">${r.notes.map(esc).join(' / ')}</div>` : '';
-    const canEdit = practice && !r.ready;
-    const songs = r.songs.map(id => {
-      const so = SONGS[id];
-      const ps = G.personalScore(S, my, id);
-      const ok = !ps.fail;
-      return `<button class="song ${r.song === id ? 'sel' : ''} ${canEdit ? '' : 'locked'}" data-act="song" data-v="${id}">
-        <div class="song-top"><span class="sg">${esc(so.genre)}</span><span class="diff d${so.diff}">${stars(so.diff)}</span></div>
-        <div class="song-nm">${so.pos ? '' : '♪ '}${esc(so.name)}</div>
-        <div class="wrow">${weightChips(so)}</div>
-        <div class="song-ft"><span class="${ok ? 'ok' : 'ng'}">${DIFF[so.diff].need ? `${STAT_FULL[ps.main]}${DIFF[so.diff].need}以上 ${ok ? '✓' : '✗ ミスしそう'}` : '初心者向け'}</span><b>${ps.score}<small>点</small></b></div>
-      </button>`;
-    }).join('');
-    const so = r.song ? SONGS[r.song] : null;
-    let team = '';
-    if (r.mates.length) {
-      const ts = so ? G.teamScore(S, my) : null;
-      team = `<h3 class="sec">チームメイト <small>ランダムで決定</small></h3>
-        <div class="mates">${r.mates.map((m, i) => {
-          const d = G.npcDef(S, m.cid);
-          const sc = ts ? ts.mates[i] : null;
-          const hasMod = Object.values(m.mod).some(v => v);
-          return tcard(d, { act: 'viewNpc', mod: m.mod, cls: isNew('mate:' + S.mission + m.cid), badge: sc ? `${sc.score}点` : '', badgeCls: hasMod ? 'warn' : 'ok' });
-        }).join('')}</div>`;
-    }
-    let pred = '';
-    if (so) {
-      const ps = G.personalScore(S, my);
-      const ts = r.mates.length ? G.teamScore(S, my) : null;
-      pred = `<div class="est"><div><small>個人ステージ予想</small><b>${ps.score}</b><span class="hint">${ps.notes.map(esc).join('・')}</span></div>
-        ${ts ? `<div style="text-align:right"><small>チーム合計予想</small><b>${ts.total}</b>${r.tmp.team ? `<span class="hint">チーム補正${r.tmp.team > 0 ? '+' : ''}${r.tmp.team}</span>` : ''}</div>` : ''}</div>`;
-    }
-    missionHtml = `${hap}${notes}
-      <h3 class="sec">${M.pos ? 'ポジションを選ぶ' : '課題曲を選ぶ'} <small>${M.pos ? '得意な能力で勝負！' : '★が多い曲は高得点。でもメイン能力が足りないとミス連発…'}</small></h3>
-      <div class="songs ${M.pos ? 'four' : ''}">${songs}</div>
-      ${team || '<h3 class="sec">ソロステージ <small>この課題はひとりで挑戦</small></h3>'}
-      ${pred}`;
-  }
-
-  // 手札
-  const hand = my.hand.map(cid => kcard(CARDS[cid], { act: 'openCard', cls: isNew('hand:' + cid) })).join('') || '<div class="empty">練習カードがありません</div>';
-
-  let actions = '';
   const host = G.isHost(S, pid);
-  if (practice) {
-    actions = r.ready
-      ? `<span class="msg">ステージ待機中…</span>${host ? '<button class="btn small" data-act="forceReady">全員を待たずに開始</button>' : ''}<button class="btn small" data-act="cancelReady">取り消す</button>`
-      : `<span class="msg">${r.song ? '練習が終わったらステージへ' : '課題曲を選んでください'}</span><button class="btn primary" data-act="ready" ${r.song ? '' : 'disabled'}>準備完了 🎤</button>`;
-  } else if (S.phase === 'result') {
-    actions = `<span class="msg">${S.ready[pid] ? 'ほかの人を待っています…' : ''}</span><button class="btn primary" data-act="openResult">結果を見る</button>`;
+  let main = '';
+  let dock = '';
+
+  if (S.phase === 'song') {
+    const mine = S.songPick.by === pid;
+    const by = G.getP(S, S.songPick.by);
+    const cards = S.songPick.choices.map(id => {
+      const so = SONGS[id];
+      const est = Math.round(STATS.reduce((t, k) => t + so.w[k] * my.st[k], 0));
+      return songCard(id, { act: mine ? 'pickSong' : '', sel: ui.songSel === id, foot: `<div class="song-ft">今のあなたなら <b>${est}</b>点</div>` });
+    }).join('');
+    main = `<div class="banner ${mine ? 'mine' : ''}">${mine ? '🎲 あなたが選曲担当！ 自分に有利な曲を選ぼう' : `⏳ ${esc(by.name)} が課題曲を選んでいます<span class="dots"></span>`}</div>
+      <h3 class="sec">課題曲の候補 <small>全員がこの中の1曲で勝負します</small></h3>
+      <div class="songs">${cards}</div>`;
+    dock = `<div class="dock slim"><div class="actions">${mine
+      ? `<span class="msg">${ui.songSel ? `「${esc(SONGS[ui.songSel].name)}」` : '曲をタップして選んでください'}</span><button class="btn primary" data-act="confirmSong" ${ui.songSel ? '' : 'disabled'}>この曲に決定</button>`
+      : `<span class="msg">選曲を待っています…</span>${host ? '<button class="btn small" data-act="force">代わりに決める</button>' : ''}`}</div></div>`;
+  } else if (S.phase === 'draft') {
+    const d = S.draft;
+    const myTurn = G.drafter(S) === pid;
+    const who = G.getP(S, G.drafter(S));
+    const teams = S.players.map(p => `<div class="tslot ${p.id === pid ? 'me' : ''}"><span class="tn">${p.id === pid ? 'あなた' : esc(p.name)}</span>
+      ${Array.from({ length: TEAM_SIZE }, (_, i) => { const c = p.r.mates[i]; return c ? `<span class="tm">${avatar(G.npcDef(S, c).name)}${esc(G.npcDef(S, c).name)}</span>` : '<span class="tm empty">空き</span>'; }).join('')}</div>`).join('');
+    const pool = d.pool.filter(c => !d.taken[c]).map(cid => memberCard(G.npcDef(S, cid), {
+      act: myTurn ? 'openMember' : 'viewMember', foot: mateFoot(cid), cls: (myTurn ? ' pickable' : '') + isNew('pool:' + S.mission + cid),
+    })).join('');
+    main = `${songPanel()}
+      <div class="banner ${myTurn ? 'mine' : ''}">${myTurn ? '👉 あなたの指名の番！ メンバーをタップして「自分のチームへ」か「ライバルに押し付け」' : `⏳ ${esc(who.name)} が指名中<span class="dots"></span>`}</div>
+      <h3 class="sec">各チームの状況</h3><div class="teams">${teams}</div>
+      <h3 class="sec">メンバー候補 <small>＋は利点、－はデメリット</small></h3>
+      <div class="m-grid">${pool}</div>`;
+    dock = `<div class="dock slim"><div class="actions"><span class="msg">指名順：${d.order.map(id => (id === G.drafter(S) ? `<b>${pname(id)}</b>` : pname(id))).join(' → ')}（くり返し）</span>${host && !myTurn ? '<button class="btn small" data-act="force">飛ばす</button>' : ''}</div></div>`;
   } else {
-    actions = '<span class="msg"></span><button class="btn gold" data-act="openResult">最終結果</button>';
+    const r = my.r;
+    const so = G.curSong(S);
+    const need = G.needOf(so);
+    const mk = G.mainStat(so);
+    const pr = G.predict(S, my);
+    const max = Math.max(14, ...STATS.map(k => my.st[k]));
+    const mates = r.mates.map(cid => memberCard(G.npcDef(S, cid), { foot: mateFoot(cid), cls: isNew('mate:' + S.mission + cid) })).join('');
+    const practice = S.phase === 'practice';
+    const setSlots = practice ? Array.from({ length: G.ACTION_SETS }, (_, i) => {
+      const x = r.set[i];
+      if (!x) return '<div class="aslot empty">アクション未セット</div>';
+      const c = CARDS[x.cid];
+      return `<div class="aslot act-${c.type}">${c.icon} <b>${esc(c.name)}</b>${x.opp ? `<small>→ ${pname(x.opp)}</small>` : ''}${r.ready ? '' : `<button data-act="unset" data-i="${i}" aria-label="外す">✕</button>`}</div>`;
+    }).join('') : '';
+    main = `${songPanel()}
+      <div class="mepanel">
+        <div class="me-hd"><span>あなたの能力</span>${pr.fail ? `<span class="warn-chip">⚠ ${STAT_NAMES[mk]}${need}未満でミスしそう</span>` : need ? '<span class="ok-chip">✓ ミスなし</span>' : ''}</div>
+        ${STATS.map(k => statBar(k, my.st[k], max, k === mk ? need : 0)).join('')}
+        <div class="pred"><div><small>予想ステージ点</small><b>${pr.total}</b></div>
+          <div class="pred-break">自分 ${pr.score}${pr.fail ? `（ミス×${FAIL_MULT}）` : ''}<br>＋ メンバー ${pr.team}<br><small>※アクションと本番ハプニングで変わります</small></div></div>
+      </div>
+      ${practice ? `<h3 class="sec">セットしたアクション <small>本番まで相手には見えません</small></h3><div class="aslots">${setSlots}</div>` : ''}
+      <h3 class="sec">あなたのステージメンバー</h3><div class="m-grid two">${mates}</div>`;
+    if (practice) {
+      const trainLeft = G.TRAIN_USES - r.used;
+      const actLeft = G.ACTION_SETS - r.set.length;
+      const list = ui.tab === 'train' ? my.train : my.act;
+      const can = !r.ready && (ui.tab === 'train' ? trainLeft > 0 : actLeft > 0);
+      const hand = list.map(cid => cardView(CARDS[cid], { act: 'openCard', cls: isNew('hand:' + cid) + (can ? '' : ' off') })).join('') || '<div class="empty">カードがありません</div>';
+      dock = `<div class="dock">
+        <div class="tabs">
+          <button class="tab ${ui.tab === 'train' ? 'on' : ''}" data-act="tab" data-v="train">💪 練習カード<small>あと${trainLeft}枚使える</small></button>
+          <button class="tab ${ui.tab === 'act' ? 'on' : ''}" data-act="tab" data-v="act">🃏 アクション<small>あと${actLeft}枚セットできる</small></button>
+        </div>
+        <div class="hand" data-keep="hand-${ui.tab}">${hand}</div>
+        <div class="actions">${r.ready
+          ? `<span class="msg">ライバルを待っています<span class="dots"></span></span>${host ? '<button class="btn small" data-act="force">全員待たずに開始</button>' : ''}<button class="btn small" data-act="cancelReady">取り消す</button>`
+          : '<span class="msg">練習とアクションが終わったら本番へ</span><button class="btn primary" data-act="ready">準備完了 🎤</button>'}</div>
+      </div>`;
+    } else {
+      dock = `<div class="dock slim"><div class="actions"><span class="msg"></span><button class="btn ${S.status === 'ended' ? 'gold' : 'primary'}" data-act="openResult">${S.status === 'ended' ? '最終結果を見る' : '結果を見る'}</button></div></div>`;
+    }
   }
 
   return `<div class="game">
     <div class="g-head">
-      <div class="week"><small>MISSION</small><b>${S.mission}</b><i>/${MISSIONS.length}</i></div>
-      <button class="wchip" data-act="info"><span class="k">第${S.mission}課題</span><span class="v">${M.icon} ${esc(M.name)}</span><span class="prog">${progress}</span></button>
-      <button class="icon-btn" data-act="ranking" aria-label="順位">🏆</button>
+      <div class="mtitle"><small>第${S.mission}課題（全${MISSIONS.length}課題）${M.mult > 1 ? `・<b>得票${M.mult}倍！</b>` : ''}</small><b>${M.icon} ${esc(M.name)}</b><span class="prog">${progress}</span></div>
       <button class="icon-btn" data-act="menu" aria-label="メニュー">☰</button>
     </div>
-    <div class="ticker" data-act="menu">${lastLog ? `<b>LOG</b>${esc(lastLog.m)}` : ''}</div>
-    ${opps ? `<div class="opps">${opps}</div>` : ''}
-    <main class="g-main" data-keep="main">
-      ${banner}
-      ${meCard}
-      ${missionHtml}
-    </main>
-    <div class="dock">
-      <div class="hand-head"><span>練習カード <b>${my.hand.length}</b>枚</span>
-        ${practice && !r.ready ? `<span class="plays">使用できる残り ${'<i class="on"></i>'.repeat(G.USES - r.used)}${'<i></i>'.repeat(r.used)}</span>` : ''}</div>
-      <div class="hand" data-keep="hand">${hand}</div>
-      <div class="actions">${actions}</div>
-    </div>
+    <main class="g-main" data-keep="main">${scoreboard()}${main}</main>
+    ${dock}
   </div>`;
 }
 
@@ -342,220 +344,157 @@ function sheetBody() {
   const sh = ui.sheet;
   switch (sh.type) {
     case 'card': return sheetCard(sh);
-    case 'npc': {
+    case 'member': {
       const d = G.npcDef(S, sh.cid);
       if (!d) return null;
-      const n = S.npc && S.npc[sh.cid];
-      return `<div class="sheet-card">${tcard(d, { cls: ' big' })}</div>
-        <div class="desc"><b>特技：${esc(d.skill)}</b><br>${esc(SKILL_DESC[d.skill] || '')}${n ? `<br>現在 <b>${n.rank}位</b>（${num(n.fans)}票）${n.out ? '・<span style="color:var(--ng)">脱落</span>' : ''}` : ''}</div>${closeBtn}`;
+      const canPick = sh.pick && S.phase === 'draft' && G.drafter(S) === pid && !S.draft.taken[sh.cid];
+      const my = me();
+      const btns = canPick ? `
+        <button class="btn primary big" data-act="pickTo" data-to="${pid}" ${G.hasSlot(my) ? '' : 'disabled'}>${G.hasSlot(my) ? '自分のチームに入れる' : '自分のチームは満員'}</button>
+        ${S.players.filter(p => p.id !== pid).map(p => `<button class="btn push" data-act="pickTo" data-to="${p.id}" ${G.hasSlot(p) ? '' : 'disabled'}>😈 ${esc(p.name)} に押し付ける${G.hasSlot(p) ? '' : '（満員）'}</button>`).join('')}` : '';
+      return `<div class="sheet-card">${memberCard(d, { cls: ' big', foot: S.song ? mateFoot(sh.cid) : '' })}</div>
+        ${canPick ? `<div class="pick-btns">${btns}</div>` : ''}${closeBtn}`;
     }
-    case 'opp': return sheetOpp(sh);
-    case 'info': return sheetInfo();
-    case 'ranking': return `<h2>🏆 現在の順位</h2><p class="hint">上位${DEBUT}人がデビュー組。${ELIM[2]}位・${ELIM[4]}位の脱落ラインにも注意！</p>${rankingList(S.ranking, { all: true })}${closeBtn}`;
+    case 'player': {
+      const p = G.getP(S, sh.pid);
+      if (!p) return null;
+      const so = G.curSong(S);
+      return `<div class="row" style="gap:12px;margin-bottom:12px">${avatar(p.name, 'lg')}<div style="flex:1"><h2 style="margin:0">${esc(p.name)}</h2>
+          <div class="hint">${TYPES[p.type].icon} ${TYPES[p.type].name}・${p.rank}位・${p.votes}万票</div></div></div>
+        ${STATS.map(k => statBar(k, p.st[k], 14, so && k === G.mainStat(so) ? G.needOf(so) : 0)).join('')}
+        ${p.r?.mates.length ? `<h4>ステージメンバー</h4><div class="m-grid two">${p.r.mates.map(c => memberCard(G.npcDef(S, c))).join('')}</div>` : ''}
+        <p class="hint">練習カード ${p.train.length}枚・アクション ${p.act.length}枚${S.phase === 'practice' ? `・セット済み ${p.r.set.length}枚` : ''}</p>${closeBtn}`;
+    }
     case 'custom': return sheetCustom(sh);
     case 'menu': return sheetMenu();
-    case 'rules': return `<h2>📖 ルール</h2>${rulesHtml()}${closeBtn}`;
+    case 'rules': return `<h2>📖 遊び方</h2>${rulesHtml()}${closeBtn}`;
   }
   return null;
 }
 
 function sheetCard(sh) {
   const my = me();
-  if (!my || !my.hand.includes(sh.cid)) return null;
   const c = CARDS[sh.cid];
+  const isTrain = c.cat === 'train';
+  if (!my || !(isTrain ? my.train : my.act).includes(sh.cid)) return null;
   const r = my.r;
-  const canUse = S.phase === 'practice' && r && !r.ready && r.used < G.USES;
+  const left = isTrain ? G.TRAIN_USES - r.used : G.ACTION_SETS - r.set.length;
+  const canUse = S.phase === 'practice' && !r.ready && left > 0;
   const prm = sh.prm;
-  let warn = '';
   let ready = canUse;
   let steps = '';
-  if (c.kind === 'night') {
-    steps = `<h4>上げる能力（+3）</h4><div class="opts">${STATS.map(k => `<button class="opt ${prm.stat === k ? 'sel' : ''}" data-act="param" data-k="stat" data-v="${k}">${STAT_FULL[k]} ${my.st[k]}→${my.st[k] + 3}</button>`).join('')}</div>`;
+  if (c.kind === 'any') {
+    steps = `<h4>どの能力を上げる？</h4><div class="opts">${STATS.map(k => `<button class="opt ${prm.stat === k ? 'sel' : ''}" data-act="param" data-k="stat" data-v="${k}">${STAT_NAMES[k]} ${my.st[k]}→${my.st[k] + 3}</button>`).join('')}</div>`;
     if (!prm.stat) ready = false;
   }
-  if (c.kind === 'devil') {
-    const others = S.players.filter(p => p.id !== pid);
-    if (!others.length) { warn = '相手のプレイヤーがいません'; ready = false; }
-    steps = `<h4>だれの得票を減らす？</h4><div class="opts">${others.map(p => `<button class="opt ${prm.opp === p.id ? 'sel' : ''}" data-act="param" data-k="opp" data-v="${p.id}">${avatar(p.name)}${esc(p.name)}<small>${p.rank}位</small></button>`).join('')}</div>`;
+  if (TARGETED.includes(c.kind)) {
+    steps = `<h4>だれに仕掛ける？</h4><div class="opts">${S.players.filter(p => p.id !== pid).map(p => `<button class="opt ${prm.opp === p.id ? 'sel' : ''}" data-act="param" data-k="opp" data-v="${p.id}">${avatar(p.name)}${esc(p.name)}<small>${p.rank}位</small></button>`).join('')}</div>`;
     if (!prm.opp) ready = false;
   }
-  if (c.kind === 'study') {
-    if (!r?.song) { warn = '先に課題曲を選んでください'; ready = false; }
-    else warn = `「${SONGS[r.song].name}」のメインは${STAT_FULL[G.mainStat(SONGS[r.song])]}`;
-  }
-  if (['teamprac', 'swap'].includes(c.kind) && r && !r.mates.length) { warn = 'この課題はソロステージなので使えません'; ready = false; }
-  if (c.kind === 'reroll' && G.mission(S).pos) { warn = 'ポジション評価では使えません'; ready = false; }
-  if (c.kind === 'low') {
-    const k = STATS.reduce((a, b) => (my.st[b] < my.st[a] ? b : a));
-    warn = `今使うと ${STAT_FULL[k]} ${my.st[k]}→${my.st[k] + 3}`;
-  }
-  if (!canUse) warn = S.phase !== 'practice' ? '練習期間に使えます' : r.ready ? '準備完了後は使えません（取り消すと使えます）' : `この課題ではもう${G.USES}枚使いました`;
-  return `<div class="sheet-card">${kcard(c, { cls: ' big' })}</div>
-    <div class="desc">${esc(c.eff)}${warn ? `<span class="warn">${warn}</span>` : ''}</div>
+  let note = '';
+  if (STATS.includes(c.kind)) note = `${STAT_NAMES[c.kind]} ${my.st[c.kind]} → ${my.st[c.kind] + 2}`;
+  if (!isTrain) note = c.type === 'def' ? '妨害されたときに自動で発動します' : 'セットしたカードは本番で公開されます';
+  if (!canUse) note = S.phase !== 'practice' ? '練習期間に使えます' : r.ready ? '準備完了を取り消すと使えます' : (isTrain ? `練習カードはもう${G.TRAIN_USES}枚使いました` : `アクションはもう${G.ACTION_SETS}枚セットしました`);
+  return `<div class="sheet-card">${cardView(c, { cls: ' big' })}</div>
+    <div class="desc">${esc(c.eff)}${note ? `<span class="warn">${note}</span>` : ''}</div>
     ${canUse ? steps : ''}
     <div class="sheet-actions"><button class="btn" data-act="closeSheet">閉じる</button>
-      ${canUse ? `<button class="btn primary wide" data-act="play" ${ready ? '' : 'disabled'}>このカードを使う</button>` : ''}</div>`;
-}
-
-function sheetOpp(sh) {
-  const p = G.getP(S, sh.pid);
-  if (!p) return null;
-  const r = p.r;
-  return `<div class="row" style="gap:12px;margin-bottom:12px">${avatar(p.name, 'lg')}<div style="flex:1"><h2 style="margin:0">${esc(p.name)}</h2>
-      <div class="hint">${TYPES[p.type].icon} ${TYPES[p.type].name}${p.grade ? `・${p.grade}クラス` : ''}・練習カード ${p.hand.length}枚</div></div>
-      <div class="me-rank">${rankBadge(p.rank, p.prevRank)}<small>${num(p.fans)}票</small></div></div>
-    <div class="me-stats">${STATS.map(k => statRow(k, p.st[k], 0, 15)).join('')}</div>
-    ${r && S.status === 'playing' ? `<h4>今回のハプニング</h4><div class="desc">${HAPPS[r.hap].icon} ${esc(HAPPS[r.hap].name)}</div>
-      <h4>課題曲</h4><div class="desc">${r.song ? `♪ ${esc(SONGS[r.song].name)}（${stars(SONGS[r.song].diff)}）` : '選曲中…'}</div>
-      ${r.mates.length ? `<h4>チームメイト</h4><div class="grp-row">${r.mates.map(m => tcard(G.npcDef(S, m.cid), { mod: m.mod })).join('')}</div>` : ''}` : ''}
-    ${closeBtn}`;
-}
-
-function sheetInfo() {
-  const M = G.mission(S);
-  return `<h2>${M.icon} 第${S.mission}課題「${esc(M.name)}」</h2>
-    <div class="desc">${esc(M.desc)}<br>得票倍率 ×${M.mult}${ELIM[S.mission] ? `<span class="warn">この課題のあと順位発表式！ ${ELIM[S.mission]}位より下の練習生は脱落</span>` : ''}</div>
-    <h4>課題の流れ</h4>
-    <div class="mission-list">${MISSIONS.map(m => `<div class="${m.n === S.mission ? 'now' : m.n < S.mission ? 'done' : ''}"><span>${m.icon}</span><b>${m.n}. ${esc(m.name)}</b><small>${m.team ? `${m.team + 1}人チーム` : 'ソロ'}・×${m.mult}${ELIM[m.n] ? `・${ELIM[m.n]}位以下脱落` : ''}${m.n === MISSIONS.length ? `・上位${DEBUT}人デビュー` : ''}</small></div>`).join('')}</div>
-    ${closeBtn}`;
+      ${canUse ? `<button class="btn primary wide" data-act="play" ${ready ? '' : 'disabled'}>${isTrain ? '使う' : '伏せてセット'}</button>` : ''}</div>`;
 }
 
 function sheetMenu() {
   const log = [...(S.log || [])].reverse().map(l => `<div class="${l.m.startsWith('──') ? 'wk' : ''}">${esc(l.m)}</div>`).join('');
   return `<h2>メニュー</h2>
-    <div class="row" style="flex-wrap:wrap"><button class="btn small" data-act="rules">📖 ルール</button><button class="btn small" data-act="ranking">🏆 順位</button><button class="btn small" data-act="share">🔗 招待リンク</button><button class="btn small" data-act="quit">🚪 退出</button></div>
-    <h4>ログ</h4><div class="log-list">${log}</div>${closeBtn}`;
+    <div class="row" style="flex-wrap:wrap"><button class="btn small" data-act="rules">📖 遊び方</button><button class="btn small" data-act="share">🔗 招待リンク</button><button class="btn small" data-act="quit">🚪 退出</button></div>
+    <h4>これまでの流れ</h4><div class="log-list">${log}</div>${closeBtn}`;
 }
 
 function sheetCustom(sh) {
   const f = sh.form;
-  const preview = { id: 'preview', name: f.name || 'なまえ', vo: f.vo, da: f.da, ra: f.ra, vi: f.vi, skill: f.skill, country: f.country.trim(), custom: true };
   const stepper = k => `<div class="stepper"><span class="lb ${k}">${STAT_NAMES[k]}</span>
     <button data-act="cstep" data-k="${k}" data-v="-1">−</button><span class="v">${f[k]}</span><button data-act="cstep" data-k="${k}" data-v="1">＋</button>
     <span class="bar"><i style="width:${f[k] / 9 * 100}%;background:var(--${k})"></i></span></div>`;
-  const total = STATS.reduce((t, k) => t + f[k], 0);
   return `<h2>✨ 練習生を作る</h2>
-    <div class="sheet-card" id="custom-preview">${tcard(preview, { cls: ' big' })}</div>
+    <p class="hint">ステージメンバーの候補として登場します。</p>
     <div class="form-grid">
       <label class="hint" for="c-name">名前（10文字まで）</label>
       <input id="c-name" class="field" data-bind="c.name" maxlength="10" value="${esc(f.name)}" placeholder="例：ミナ" autocomplete="off">
-      <label class="hint">能力値（0〜9）　合計 <b style="color:${total > 14 ? 'var(--gold)' : '#fff'}">${total}</b> <small>※標準の練習生は合計8〜13程度</small></label>
+      <label class="hint">能力（0〜9）<small>　標準の練習生は1〜5くらい</small></label>
       ${STATS.map(stepper).join('')}
-      <label class="hint">特技</label>
-      <div class="skill-grid">${SKILL_LIST.map(s => `<button class="opt ${f.skill === s ? 'sel' : ''}" data-act="cskill" data-v="${s}">${esc(s)}<small>${esc(SKILL_DESC[s])}</small></button>`).join('')}</div>
+      <label class="hint">特徴</label>
+      <div class="trait-grid">${Object.entries(TRAITS).map(([k, t]) => `<button class="opt trait ${f.trait === k ? 'sel' : ''}" data-act="ctrait" data-v="${k}"><b>${esc(t.name)}</b><span class="p">＋${esc(t.plus)}</span><span class="m">－${esc(t.minus)}</span></button>`).join('')}</div>
       <label class="hint" for="c-country">出身国（空欄でOK）</label>
       <input id="c-country" class="field" data-bind="c.country" maxlength="8" value="${esc(f.country)}" placeholder="例：日本" autocomplete="off">
     </div>
-    <div class="sheet-actions"><button class="btn" data-act="closeSheet">やめる</button><button class="btn primary wide" data-act="saveCustom">番組に追加する</button></div>`;
+    <div class="sheet-actions"><button class="btn" data-act="closeSheet">やめる</button><button class="btn primary wide" data-act="saveCustom">追加する</button></div>`;
 }
 
-function rankingList(list, o = {}) {
-  const myIds = new Set(S.players.map(p => p.id));
-  let rows = list;
-  if (!o.all) {
-    // 上位 + プレイヤー周辺のみ
-    rows = list.filter(e => e.rank <= DEBUT || myIds.has(e.id));
-  }
-  let html = '';
-  let prevRank = 0;
-  rows.forEach(e => {
-    if (prevRank && e.rank > prevRank + 1) html += '<div class="rk-gap">⋮</div>';
-    if (prevRank <= DEBUT && e.rank > DEBUT && prevRank) html += `<div class="rk-line">─── デビューライン（${DEBUT}位）───</div>`;
-    const isP = e.kind === 'p';
-    const diff = e.prev ? e.prev - e.rank : 0;
-    const arrow = e.out ? '' : diff > 0 ? `<i class="up">▲${diff}</i>` : diff < 0 ? `<i class="down">▼${-diff}</i>` : '<i class="eq">−</i>';
-    html += `<div class="rk ${isP ? 'player' : ''} ${e.id === pid ? 'me' : ''} ${e.out ? 'out' : ''}" ${isP ? '' : `data-act="viewNpc" data-cid="${e.id}"`}>
-      <span class="no">${e.rank}</span>${avatar(e.name)}<span class="nm">${esc(e.name)}${isP ? '<small>PLAYER</small>' : ''}${e.out ? '<small class="o">脱落</small>' : ''}</span>
-      <span class="ar">${arrow}</span><span class="fv">${num(e.fans)}<small>票</small></span></div>`;
-    prevRank = e.rank;
-  });
-  return `<div class="rk-list">${html}</div>`;
-}
-
-// --- 結果モーダル ---
+// --- 結果 ---
 function viewResult() {
   const R = S.results;
   const M = MISSIONS[R.mission - 1];
+  const so = SONGS[R.song];
+  const rows = R.rows.map((row, i) => `<div class="rrow ${row.pid === pid ? 'me' : ''}${enter(`rr:${R.mission}:${row.pid}`)}" style="--i:${R.rows.length - 1 - i}">
+      <div class="hd"><div class="rank r${row.rank}">${row.rank}位</div>${avatar(row.name)}
+        <div class="nm">${esc(row.name)}<div class="gain">得票 ${sv(row.gain)}万</div></div>
+        <div class="sc"><b>${row.total}</b><small>ステージ点</small></div></div>
+      <div class="rbrk">自分 ${row.self}${row.fail ? '（ミス連発…）' : ''}　メンバー ${row.team}（${row.mates.map(m => esc(G.npcDef(S, m.cid).name)).join('・')}）</div>
+      ${row.ev.length ? `<div class="evs">${row.ev.map(e => `<span class="${e.bad ? 'bad' : e.good ? 'good' : ''}">${esc(e.t)}${e.v ? ` <b>${sv(e.v)}点</b>` : ''}${e.votes ? ` <b>${sv(e.votes)}万票</b>` : ''}</span>`).join('')}</div>` : ''}
+    </div>`).join('');
+  const readyCnt = S.players.filter(p => S.ready[p.id]).length;
   const host = G.isHost(S, pid);
-  const readyCnt = Object.keys(S.ready || {}).length;
-  let body;
-  if (ui.resultStep === 0) {
-    body = R.rows.map((row, i) => {
-      const so = SONGS[row.song];
-      const h = HAPPS[row.hap];
-      return `<div class="rrow ${row.pid === pid ? 'me' : ''}${enter(`rr:${R.mission}:${row.pid}`)}" style="--i:${i}">
-        <div class="hd">${avatar(row.name)}<div class="nm">${esc(row.name)}${row.grade ? ` <b class="grade g${row.grade}">${row.grade}</b>` : ''}<div class="gain">${signed(row.gain)}票</div></div>
-          <div class="sc"><b>${row.me.score}</b><small>個人ステージ点</small></div></div>
-        <div class="items"><span>♪ ${esc(so.name)}（${stars(so.diff)}）</span><span>${h.icon} ${esc(h.name)}</span></div>
-        ${row.me.notes.length ? `<div class="items">${row.me.notes.map(n => `<span>${esc(n)}</span>`).join('')}</div>` : ''}
-        ${row.mates.length ? `<div class="perf">${row.mates.map(m => `<span class="pm"><b>${esc(m.name)}</b> ${m.score}点</span>`).join('')}</div>` : ''}
-        ${row.rival ? `<div class="vs ${row.win ? 'win' : 'lose'}"><span>チーム ${row.total}点</span><b>${row.win ? 'WIN' : 'LOSE'}</b><span>${row.rival.score}点 ライバル（${row.rival.names.map(esc).join('・')}）</span></div>` : ''}
-        <div class="items">${row.items.map(it => `<span>${esc(it.label)} <b>${signed(it.v)}</b></span>`).join('')}</div>
-      </div>`;
-    }).join('');
-  } else {
-    body = `${R.eliminated.length ? `<div class="elim">😢 ${R.cut}位より下の練習生 ${R.eliminated.length}人が脱落しました<small>${R.eliminated.map(esc).join('・')}</small></div>` : ''}
-      ${rankingList(S.ranking)}`;
-  }
-  const next = R.mission >= MISSIONS.length ? '最終結果へ ▶' : `OK！第${R.mission + 1}課題へ ▶`;
+  const standings = [...S.players].sort((a, b) => a.rank - b.rank).map(p => `<span class="${p.id === pid ? 'me' : ''}">${p.rank}位 ${esc(p.name)} <b>${p.votes}万</b></span>`).join('');
   return `<div class="overlay${enter('ovr:' + R.mission)}"></div><div class="modal${enter('mr:' + R.mission)}" data-keep="modal">
-    <h2>${ui.resultStep === 0 ? `${M.icon} 第${R.mission}課題 ステージ結果` : `🏆 ${R.cut ? '順位発表式' : '現在の順位'}`}</h2>
-    <div class="sub">${ui.resultStep === 0 ? `${esc(M.name)}・得票×${M.mult}` : `全${S.ranking.length}人中・上位${DEBUT}人がデビュー組`}</div>
-    ${body}
+    <h2>${M.icon} 第${R.mission}課題 結果発表</h2>
+    <div class="sub">♪ ${esc(so.name)}（${stars(so.diff)}）・順位の得票 ${(VOTES[S.players.length] || VOTES[4]).map(v => v * M.mult).join('／')}万</div>
+    ${rows}
+    <div class="standings"><small>現在の順位</small>${standings}</div>
     <div class="modal-actions">
-      ${ui.resultStep === 0
-        ? '<button class="btn primary big" data-act="resultNext">順位発表へ ▶</button>'
-        : S.ready[pid]
-          ? `<div class="waiting">ほかの人を待っています（${readyCnt}/${S.players.length}）<span class="dots"></span></div>`
-          : `<button class="btn primary big" data-act="ready2">${next}</button>`}
-      ${ui.resultStep === 1 ? '<button class="btn ghost small" data-act="resultBack">◀ ステージ結果に戻る</button>' : ''}
-      ${host && S.ready[pid] ? '<button class="btn small" data-act="forceNext">全員を待たずに進める</button>' : ''}
-      <button class="btn ghost small" data-act="closeResult">盤面を見る</button>
+      ${S.ready[pid]
+        ? `<div class="waiting">ほかの人を待っています（${readyCnt}/${S.players.length}）<span class="dots"></span></div>`
+        : `<button class="btn primary big" data-act="ready2">${R.mission >= MISSIONS.length ? '最終結果へ ▶' : '次の課題へ ▶'}</button>`}
+      ${host && S.ready[pid] ? '<button class="btn small" data-act="force">全員待たずに進める</button>' : ''}
+      <button class="btn ghost small" data-act="closeResult">画面に戻る</button>
     </div></div>`;
 }
 
 function viewEnd() {
-  const top = S.final[0];
-  const iWon = top.pid === pid;
+  const winners = S.final.filter(f => f.rank === 1);
   const my = S.final.find(f => f.pid === pid);
+  const iWon = my.rank === 1;
   const colors = ['#ff5fa2', '#ffd166', '#9b6bff', '#4fc3ff', '#3ee0a0'];
-  const confetti = my.debut ? `<div class="confetti">${Array.from({ length: 40 }, (_, i) => `<i style="left:${Math.random() * 100}%;background:${colors[i % 5]};animation-duration:${2.5 + Math.random() * 3}s;animation-delay:${Math.random() * 3}s"></i>`).join('')}</div>` : '';
-  const rows = S.final.map(f => `<div class="rrow ${f.pid === pid ? 'me' : ''}"><div class="hd"><div class="rank r${Math.min(f.rank, 4)}">${f.rank}位</div><div class="nm">${esc(f.name)}<div class="gain">${f.debut ? '🎉 デビュー決定' : 'デビューならず…'}</div></div><div class="sc"><b>${num(f.fans)}</b><small>票</small></div></div></div>`).join('');
-  const debut = S.debut.map((e, i) => `<span class="db ${e.kind === 'p' ? 'p' : ''}">${i + 1}. ${esc(e.name)}</span>`).join('');
+  const confetti = iWon ? `<div class="confetti">${Array.from({ length: 40 }, (_, i) => `<i style="left:${Math.random() * 100}%;background:${colors[i % 5]};animation-duration:${2.5 + Math.random() * 3}s;animation-delay:${Math.random() * 3}s"></i>`).join('')}</div>` : '';
+  const rows = S.final.map(f => `<div class="rrow ${f.pid === pid ? 'me' : ''}"><div class="hd"><div class="rank r${f.rank}">${f.rank}位</div>${avatar(f.name)}<div class="nm">${esc(f.name)}<div class="gain">${f.rank === 1 ? '🎉 デビュー決定！' : '練習生として再出発…'}</div></div><div class="sc"><b>${f.votes}</b><small>万票</small></div></div></div>`).join('');
   const host = G.isHost(S, pid);
   return `<div class="overlay"></div>${confetti}<div class="modal${enter('end')}" data-keep="end">
-    <div class="trophy">${my.debut ? '🏆' : '🌙'}</div>
-    <div class="winner">${iWon ? '<span>あなたが最上位！</span>' : `<span>${esc(top.name)}</span> が最上位！`}<br>${my.debut ? `${my.rank}位でデビュー決定！` : `${my.rank}位…デビューならず`}</div>
-    <div class="sub">プレイヤーの最終順位</div>
+    <div class="trophy">${iWon ? '🏆' : '🌙'}</div>
+    <div class="winner"><span>${winners.map(w => esc(w.name)).join('・')}</span><br>デビュー決定！</div>
+    <div class="sub">${iWon ? 'おめでとう！ あなたが一番票を集めました' : `あなたは${my.rank}位でした`}</div>
     ${rows}
-    <h4 style="color:var(--pink2);margin:14px 0 6px">✨ デビュー組（上位${DEBUT}人）</h4>
-    <div class="debut-list">${debut}</div>
     <div class="modal-actions">
-      ${host ? '<button class="btn primary big" data-act="again">もう一度遊ぶ（待機室へ）</button>' : '<div class="waiting">ホストが「もう一度遊ぶ」を押すと待機室に戻ります</div>'}
-      <button class="btn ghost small" data-act="closeEnd">盤面を見る</button>
+      ${host ? '<button class="btn primary big" data-act="again">もう一度遊ぶ</button>' : '<div class="waiting">ホストが「もう一度遊ぶ」を押すと待機室に戻ります</div>'}
+      <button class="btn ghost small" data-act="closeEnd">画面に戻る</button>
       <button class="btn ghost small" data-act="quit">退出する</button>
     </div></div>`;
 }
 
 function rulesHtml() {
+  const t = VOTES[4];
+  const uniq = cat => [...new Map(Object.values(CARDS).filter(c => c.cat === cat).map(c => [c.kind, c])).values()];
   return `<div class="rules">
-    <p>あなたはサバイバルオーディション番組に参加した<b>練習生</b>。全5つの課題をこなしてファンの票を集め、<b>最終順位が一番高いプレイヤーの勝ち</b>。上位${DEBUT}人に入れば<b>デビュー決定</b>！ ほかの参加者（NPC練習生）も成長しながら票を集めてきます。</p>
-    <h4>準備</h4><p>待機室で自分のタイプを選びます（最初の能力値と特性が決まる）。</p>
-    <h4>課題の流れ（全員同時に進行）</h4>
-    <p>① 課題が始まると、<b>課題曲の候補2曲</b>・<b>ランダムなチームメイト</b>・<b>ハプニング</b>が配られ、練習カードを4枚引く<br>
-    ② 練習期間：練習カードを<b>最大3枚</b>使って自分の能力を上げる。課題曲を1曲選ぶ<br>
-    ③ 「準備完了」を押す。全員そろったらステージ！<br>
-    ④ 個人ステージ点・チームの勝敗で得票が決まり、全練習生の順位が発表される</p>
+    <p>あなたはオーディション番組の<b>練習生</b>。毎回<b>全員が同じ課題曲</b>でステージ点を競い、順位に応じて票が入ります。全5課題で<b>一番票を集めた人がデビュー</b>！</p>
+    <h4>1つの課題の流れ</h4>
+    <p>① <b>選曲</b>：ランダムに選ばれた「選曲担当」が3曲の候補から1曲を選ぶ（毎回ちがう曲）<br>
+    ② <b>メンバー選び</b>：票が少ない人から順に、候補の練習生を1人ずつ指名。<b>自分のチームに入れる</b>か、<b>ライバルに押し付ける</b>かを選べる。全員のチームが${TEAM_SIZE}人になるまで続く<br>
+    ③ <b>練習期間</b>（全員同時）：練習カードを<b>2枚まで</b>使って能力アップ ＋ アクションカードを<b>2枚まで</b>伏せてセット<br>
+    ④ <b>本番</b>：アクションを公開 → ステージ点の高い順に票が入る</p>
     <h4>ステージ点</h4>
-    <p>個人ステージ点 ＝ 各能力 × 曲の重み の合計<br>
-    難しい曲（★★・★★★）はクリアすると×${DIFF[2].mult}・×${DIFF[3].mult}。でも<b>メイン能力が足りないとミス連発で×${FAIL_MULT}</b>（★★は${DIFF[2].need}以上、★★★は${DIFF[3].need}以上必要）<br>
-    得票 ≒ 個人ステージ点 × 80 × 課題の倍率 ＋ チーム勝利ベネフィット など</p>
-    <h4>課題</h4><table>${MISSIONS.map(m => `<tr><td>${m.icon} ${m.name}</td><td>${m.desc}（得票×${m.mult}）${ELIM[m.n] ? `<br><b>終了後、${ELIM[m.n]}位より下のNPCは脱落</b>` : ''}</td></tr>`).join('')}</table>
-    <p class="hint">※プレイヤーは脱落しません（国民プロデューサーの救済！）</p>
-    <h4>タイプ</h4><table>${Object.values(TYPES).map(t => `<tr><td>${t.icon} ${t.name}</td><td>${STATS.map(k => `${STAT_NAMES[k]}${t.st[k]}`).join(' ')}<br>${t.perk}</td></tr>`).join('')}</table>
-    <h4>練習カード</h4><table>${[...new Map(Object.values(CARDS).map(c => [c.kind, c])).values()].map(c => `<tr><td>${c.icon} ${c.name}</td><td>${c.eff}</td></tr>`).join('')}</table>
-    <h4>ハプニング（毎課題ひとりずつ）</h4><table>${Object.values(HAPPS).map(h => `<tr><td>${h.icon} ${h.name}</td><td>${h.eff}</td></tr>`).join('')}</table>
-    <h4>チームメイトの特技</h4><table>${SKILL_LIST.filter(s => s !== 'なし').map(s => `<tr><td>${s}</td><td>${SKILL_DESC[s]}</td></tr>`).join('')}</table>
+    <p>自分の点 ＝ 能力 × 曲の重み の合計<br>メンバーの点は半分＋特徴の効果<br>★★の曲はメイン能力7以上、★★★は10以上ないと<b>ミス連発（×${FAIL_MULT}）</b></p>
+    <h4>順位ごとの得票</h4><p>4人なら 1位${t[0]}万／2位${t[1]}万／3位${t[2]}万／4位${t[3]}万（最終課題は2倍）</p>
+    <h4>練習カード</h4><table>${uniq('train').map(c => `<tr><td>${c.icon} ${c.name}</td><td>${c.eff}</td></tr>`).join('')}</table>
+    <h4>アクションカード</h4><table>${uniq('action').map(c => `<tr><td>${c.icon} ${c.name}<br><small>${ACTION_TYPES[c.type]}</small></td><td>${c.eff}</td></tr>`).join('')}</table>
+    <h4>メンバーの特徴</h4><table>${Object.values(TRAITS).map(x => `<tr><td>${x.name}</td><td>＋${x.plus}<br>－${x.minus}</td></tr>`).join('')}</table>
+    <h4>本番ハプニング</h4><table>${HAPPS.filter(h => h.id !== 'none').map(h => `<tr><td>${h.icon} ${h.name}</td><td>${h.v ? `ステージ点${sv(h.v)}` : ''}${h.votes ? `得票${sv(h.votes)}万` : ''}</td></tr>`).join('')}</table>
   </div>`;
 }
 
@@ -570,13 +509,11 @@ const handlers = {
     const name = ui.form.name.trim();
     const room = ui.form.room.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 12);
     if (!name) return toast('名前を入力してください', 'err');
-    if (!room) return toast('ルームIDを入力してください（「作成」で自動生成できます）', 'err');
+    if (!room) return toast('ルームIDを入力してください（「作成」で自動で作れます）', 'err');
     await joinAndListen(room, name);
   },
   rules() { openSheet('rules'); },
   menu() { openSheet('menu'); },
-  info() { openSheet('info'); },
-  ranking() { openSheet('ranking'); },
   closeSheet() { closeSheet(); },
   async share() {
     const url = `${location.origin}${location.pathname}?room=${encodeURIComponent(roomId)}`;
@@ -589,27 +526,27 @@ const handlers = {
     exitRoom();
   },
   quit() {
-    if (S && S.status === 'playing' && !confirm('退出しますか？（同じ名前・ルームIDで再入室できます）')) return;
+    if (S && S.status === 'playing' && !confirm('退出しますか？（同じ名前・ルームIDで戻れます）')) return;
     exitRoom();
   },
   setType(ds) { act(s => G.setType(s, pid, ds.v)); },
   start() { act(s => G.startGame(s, pid)); },
-  openCustom() { openSheet('custom', { form: { name: '', vo: 2, da: 2, ra: 2, vi: 2, skill: 'なし', country: '' } }); },
+  openCustom() { openSheet('custom', { form: { name: '', vo: 3, da: 3, ra: 3, vi: 3, trait: 'leader', country: '' } }); },
   cstep(ds) {
     const f = ui.sheet.form;
     f[ds.k] = Math.max(0, Math.min(9, f[ds.k] + Number(ds.v)));
     render();
   },
-  cskill(ds) { ui.sheet.form.skill = ds.v; render(); },
+  ctrait(ds) { ui.sheet.form.trait = ds.v; render(); },
   async saveCustom() {
     const f = ui.sheet.form;
     if (!f.name.trim()) return toast('名前を入力してください', 'err');
     const r = await act(s => G.addCustom(s, pid, f));
     if (r && !r.error) {
       const list = savedCustoms().filter(c => c.name !== f.name.trim());
-      list.unshift({ name: f.name.trim(), vo: f.vo, da: f.da, ra: f.ra, vi: f.vi, skill: f.skill, country: f.country.trim() });
+      list.unshift({ name: f.name.trim(), vo: f.vo, da: f.da, ra: f.ra, vi: f.vi, trait: f.trait, country: f.country.trim() });
       savedCustomStore.set(JSON.stringify(list.slice(0, 12)));
-      toast(`「${f.name.trim()}」が番組に参加しました`);
+      toast(`「${f.name.trim()}」を追加しました`);
       closeSheet();
     }
   },
@@ -619,35 +556,40 @@ const handlers = {
     if (c) act(s => G.addCustom(s, pid, c));
   },
   delCustom(ds) { act(s => G.removeCustom(s, pid, ds.id)); },
-  viewNpc(ds) { openSheet('npc', { cid: ds.cid }); },
-  viewOpp(ds) { openSheet('opp', { pid: ds.id }); },
+  viewPlayer(ds) { openSheet('player', { pid: ds.id }); },
+  viewMember(ds) { openSheet('member', { cid: ds.cid }); },
+  openMember(ds) { openSheet('member', { cid: ds.cid, pick: true }); },
+  async pickTo(ds) {
+    const cid = ui.sheet.cid;
+    const r = await act(s => G.draftPick(s, pid, cid, ds.to));
+    if (r && !r.error) {
+      closeSheet();
+      toast(ds.to === pid ? `${G.npcDef(S, cid).name} を指名しました` : `${G.npcDef(S, cid).name} を ${G.getP(S, ds.to).name} に押し付けた！`, 'hi');
+    }
+  },
+  pickSong(ds) { ui.songSel = ds.v; render(); },
+  confirmSong() { if (ui.songSel) act(s => G.chooseSong(s, pid, ui.songSel)); },
+  tab(ds) { ui.tab = ds.v; render(); },
   openCard(ds) { openSheet('card', { cid: ds.cid }); },
   param(ds) { ui.sheet.prm[ds.k] = ds.v; render(); },
-  song(ds) {
-    const r = me()?.r;
-    if (!r || S.phase !== 'practice') return;
-    if (r.ready) return toast('準備完了を取り消すと変更できます', 'err');
-    act(s => G.chooseSong(s, pid, ds.v));
-  },
   async play() {
     const { cid, prm } = ui.sheet;
     const c = CARDS[cid];
-    const r = await act(s => G.playCard(s, pid, cid, prm));
-    if (r && !r.error) { ui.sheet = null; render(); toast(`${c.icon} ${c.name}`, 'hi'); }
+    const r = await act(s => (c.cat === 'train' ? G.useTrain(s, pid, cid, prm) : G.setAction(s, pid, cid, prm)));
+    if (r && !r.error) { ui.sheet = null; render(); toast(c.cat === 'train' ? `${c.icon} ${c.name}` : `🃏 「${c.name}」を伏せました`, 'hi'); }
   },
+  unset(ds) { act(s => G.unsetAction(s, pid, Number(ds.i))); },
   ready() {
     const my = me();
-    if (my.r.used < G.USES && my.hand.length && !confirm(`練習カードをあと${G.USES - my.r.used}枚使えます。準備完了にしますか？`)) return;
-    const ps = G.personalScore(S, my);
-    if (ps.fail && !confirm(`このままだと${STAT_FULL[ps.main]}が足りずミス連発（×${FAIL_MULT}）しそうです。それでも挑戦しますか？`)) return;
+    const left = [];
+    if (my.r.used < G.TRAIN_USES && my.train.length) left.push(`練習カードあと${G.TRAIN_USES - my.r.used}枚`);
+    if (my.r.set.length < G.ACTION_SETS && my.act.length) left.push(`アクションあと${G.ACTION_SETS - my.r.set.length}枚`);
+    if (left.length && !confirm(`${left.join('・')}使えます。本番に進みますか？`)) return;
     act(s => G.setReady(s, pid));
   },
   cancelReady() { act(s => G.cancelReady(s, pid)); },
-  forceReady() { if (confirm('まだ準備していない人を自動で準備完了にして、ステージを始めますか？')) act(s => G.forceReady(s, pid)); },
-  resultNext() { ui.resultStep = 1; render(); app.querySelector('.modal')?.scrollTo(0, 0); },
-  resultBack() { ui.resultStep = 0; render(); },
+  force() { if (confirm('止まっている人の代わりに進めますか？')) act(s => G.forceAdvance(s, pid)); },
   ready2() { act(s => G.readyNext(s, pid)); },
-  forceNext() { if (confirm('全員を待たずに次へ進みますか？')) act(s => G.readyNext(s, pid, true)); },
   closeResult() { ui.closedResult = S.results.mission; render(); },
   openResult() { ui.closedResult = 0; render(); },
   closeEnd() { ui.closedResult = 'end'; render(); },
@@ -663,12 +605,8 @@ app.addEventListener('click', e => {
 app.addEventListener('input', e => {
   const k = e.target.dataset.bind;
   if (!k) return;
-  if (k.startsWith('c.')) {
-    ui.sheet.form[k.slice(2)] = e.target.value;
-    const f = ui.sheet.form;
-    const prev = document.getElementById('custom-preview');
-    if (prev) prev.innerHTML = tcard({ id: 'preview', name: f.name || 'なまえ', vo: f.vo, da: f.da, ra: f.ra, vi: f.vi, skill: f.skill, country: f.country.trim(), custom: true }, { cls: ' big' });
-  } else ui.form[k] = e.target.value;
+  if (k.startsWith('c.')) ui.sheet.form[k.slice(2)] = e.target.value;
+  else ui.form[k] = e.target.value;
 });
 app.addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.target.dataset.bind && !e.target.dataset.bind.startsWith('c.')) handlers.enter();
@@ -707,12 +645,14 @@ function onState(st) {
   if (!st.players.some(p => p.id === pid)) { toast('部屋から退出しました'); exitRoom(); return; }
   S = st;
   if (prev && st.status === 'playing') {
-    if (st.mission !== prev.mission) {
-      ui.closedResult = 0;
-      toast(`${MISSIONS[st.mission - 1].icon} 第${st.mission}課題「${MISSIONS[st.mission - 1].name}」開始！`, 'hi');
-      navigator.vibrate?.(100);
-    }
-    if (st.phase === 'result' && prev.phase !== 'result') { ui.resultStep = 0; navigator.vibrate?.(150); }
+    if (st.mission !== prev.mission) { ui.closedResult = 0; ui.songSel = null; ui.tab = 'train'; }
+    if (st.phase === 'song' && prev.phase !== 'song' && st.songPick.by === pid) { toast('🎲 あなたが選曲担当です！', 'hi'); navigator.vibrate?.(120); }
+    if (st.phase === 'draft' && prev.phase === 'song') toast(`♪「${SONGS[st.song].name}」に決定！`, 'hi');
+    const myDraft = st.phase === 'draft' && G.drafter(st) === pid;
+    const wasMyDraft = prev.phase === 'draft' && G.drafter(prev) === pid && prev.draft?.idx === st.draft?.idx;
+    if (myDraft && !wasMyDraft) { toast('👉 あなたの指名の番です！', 'hi'); navigator.vibrate?.(120); }
+    if (st.phase === 'practice' && prev.phase === 'draft') toast('💪 練習期間スタート！', 'hi');
+    if (st.phase === 'result' && prev.phase !== 'result') navigator.vibrate?.(150);
   }
   if (prev && prev.status !== 'lobby' && st.status === 'lobby') { seen.clear(); ui.closedResult = 0; }
   render();
